@@ -244,8 +244,8 @@ fn main() {
 
         // Create indexer
         let mut indexer = None;
-        if let Some(uri) = config.indexer {
-            indexer = Some(Client::new(&uri, *identity, strategy.clone()));
+        if let Some(indexer_url) = config.indexer.as_deref() {
+            indexer = Some(Client::new(indexer_url, *identity, strategy.clone()));
         }
 
         // Create engine
@@ -269,6 +269,8 @@ fn main() {
             max_fetch_size: MAX_FETCH_SIZE,
             fetch_concurrent: FETCH_CONCURRENT,
             fetch_rate_per_peer: resolver_limit,
+            backfiller_max_active: config.backfiller_max_active,
+            backfiller_retry: Duration::from_millis(config.backfiller_retry_ms),
             indexer,
             polynomial,
             share,

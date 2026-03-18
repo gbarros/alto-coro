@@ -191,6 +191,7 @@ impl<S: Strategy> Indexer<S> {
                         .map(|f| BlockResult::Finalized(f.clone()))
                 })
             } else if raw.len() == Digest::SIZE {
+                // Try to parse as digest
                 let digest = Digest::decode(raw.as_slice()).ok()?;
                 state
                     .blocks_by_digest
@@ -202,6 +203,12 @@ impl<S: Strategy> Indexer<S> {
         } else {
             None
         }
+    }
+
+    pub fn submit_block(&self, block: Block) {
+        // Store block by digest (no guarantee this is part of the canonical chain)
+        let mut state = self.state.write().unwrap();
+        state.blocks_by_digest.insert(block.digest(), block);
     }
 
     pub fn consensus_subscriber(&self) -> broadcast::Receiver<Vec<u8>> {
@@ -233,6 +240,7 @@ impl<S: Strategy> Api<S> {
             .route("/notarization/{query}", get(notarization_get))
             .route("/finalization", post(finalization_upload))
             .route("/finalization/{query}", get(finalization_get))
+            .route("/block", post(block_upload))
             .route("/block/{query}", get(block_get))
             .route("/consensus/ws", get(consensus_ws))
             .layer(CorsLayer::permissive())
@@ -310,6 +318,19 @@ async fn finalization_get<S: Strategy>(
     match indexer.get_finalization(&query) {
         Some(finalized) => (StatusCode::OK, finalized.encode().to_vec()).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn block_upload<S: Strategy>(
+    AxumState(indexer): AxumState<Arc<Indexer<S>>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    match Block::decode(&mut body.as_ref()) {
+        Ok(block) => {
+            indexer.submit_block(block);
+            StatusCode::OK
+        }
+        Err(_) => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -584,6 +605,23 @@ mod tests {
         match payload {
             alto_client::consensus::Payload::Block(b) => {
                 assert_eq!(b.digest(), block.digest());
+            }
+            _ => panic!("Expected block"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_block_upload() {
+        let ctx = TestContext::new().await;
+        let block = ctx.test_block();
+        let digest = block.digest();
+
+        ctx.client.block_upload(block).await.unwrap();
+
+        let payload = ctx.client.block_get(Query::Digest(digest)).await.unwrap();
+        match payload {
+            alto_client::consensus::Payload::Block(b) => {
+                assert_eq!(b.digest(), digest);
             }
             _ => panic!("Expected block"),
         }

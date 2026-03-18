@@ -37,8 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize indexer
     let certificate_verifier = Scheme::certificate_verifier(NAMESPACE, identity);
     let indexer = Arc::new(Indexer::new(certificate_verifier, Sequential));
-    let api = Api::new(indexer);
-    let app = api.router();
+    let app = Api::new(indexer).router();
 
     // Start server
     let addr = format!("0.0.0.0:{}", args.port);

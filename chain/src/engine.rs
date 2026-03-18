@@ -1,6 +1,6 @@
 use crate::{
     application::Application,
-    indexer::{self, Indexer},
+    indexer::{self, Client},
 };
 use alto_types::{Activity, Block, Finalization, Scheme, EPOCH, EPOCH_LENGTH, NAMESPACE};
 use commonware_broadcast::buffered;
@@ -28,7 +28,7 @@ use commonware_runtime::{
     buffer::paged::CacheRef, spawn_cell, BufferPooler, Clock, ContextCell, Handle, Metrics,
     Spawner, Storage, ThreadPooler,
 };
-use commonware_storage::archive::immutable;
+use commonware_storage::{archive::immutable, queue};
 use commonware_utils::channel::mpsc;
 use commonware_utils::{ordered::Set, NZU16};
 use commonware_utils::{NZUsize, NZU64};
@@ -37,19 +37,20 @@ use governor::clock::Clock as GClock;
 use governor::Quota;
 use rand::{CryptoRng, Rng};
 use std::{
-    num::NonZero,
+    num::{NonZero, NonZeroUsize},
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
 
 /// Reporter type for [simplex::Engine].
-type Reporter<E, I> =
-    Reporters<Activity, MarshalMailbox<Scheme, Standard<Block>>, Option<indexer::Pusher<E, I>>>;
+type Reporter<E, C> =
+    Reporters<Activity, MarshalMailbox<Scheme, Standard<Block>>, Option<indexer::Pusher<E, C>>>;
 
 /// To better support peers near tip during network instability, we multiply
 /// the consensus activity timeout by this factor.
 const SYNCER_ACTIVITY_TIMEOUT_MULTIPLIER: u64 = 10;
 const PRUNABLE_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(4_096);
+const QUEUE_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(128);
 const IMMUTABLE_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(262_144);
 const FREEZER_TABLE_RESIZE_FREQUENCY: u8 = 4;
 const FREEZER_TABLE_RESIZE_CHUNK_SIZE: u32 = 2u32.pow(16); // 3MB
@@ -66,7 +67,7 @@ const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(16);
 pub struct Config<
     B: Blocker<PublicKey = PublicKey>,
     P: Provider<PublicKey = PublicKey>,
-    I: Indexer,
+    C: Client,
     S: Strategy,
 > {
     pub blocker: B,
@@ -91,23 +92,25 @@ pub struct Config<
     pub max_fetch_size: usize,
     pub fetch_concurrent: usize,
     pub fetch_rate_per_peer: Quota,
+    pub backfiller_max_active: NonZeroUsize,
+    pub backfiller_retry: Duration,
 
     pub strategy: S,
 
-    pub indexer: Option<I>,
+    pub indexer: Option<C>,
 }
 
-type Marshaled<E> = Deferred<E, Scheme, Application, Block, FixedEpocher>;
+type Marshaled<E> = Deferred<E, Scheme, Application<E>, Block, FixedEpocher>;
 
 /// The engine that drives the [Application].
 #[allow(clippy::type_complexity)]
-pub struct Engine<E, B, P, S, I>
+pub struct Engine<E, B, P, S, C>
 where
     E: BufferPooler + Clock + GClock + Rng + CryptoRng + Spawner + Storage + Metrics,
     B: Blocker<PublicKey = PublicKey>,
     P: Provider<PublicKey = PublicKey>,
     S: Strategy,
-    I: Indexer,
+    C: Client,
 {
     context: ContextCell<E>,
 
@@ -125,19 +128,21 @@ where
     marshaled: Marshaled<E>,
 
     consensus:
-        Consensus<E, Scheme, Random, B, Digest, Marshaled<E>, Marshaled<E>, Reporter<E, I>, S>,
+        Consensus<E, Scheme, Random, B, Digest, Marshaled<E>, Marshaled<E>, Reporter<E, C>, S>,
+
+    consumer: Option<indexer::Consumer<E, C>>,
 }
 
-impl<E, B, P, S, I> Engine<E, B, P, S, I>
+impl<E, B, P, S, C> Engine<E, B, P, S, C>
 where
     E: BufferPooler + Clock + GClock + Rng + CryptoRng + Spawner + ThreadPooler + Storage + Metrics,
     B: Blocker<PublicKey = PublicKey>,
     P: Provider<PublicKey = PublicKey>,
     S: Strategy,
-    I: Indexer,
+    C: Client,
 {
     /// Create a new [Engine].
-    pub async fn new(context: E, cfg: Config<B, P, I, S>) -> Self {
+    pub async fn new(context: E, cfg: Config<B, P, C, S>) -> Self {
         // Create the buffer
         let (buffer, buffer_mailbox) = buffered::Engine::new(
             context.with_label("buffer"),
@@ -266,8 +271,40 @@ where
         )
         .await;
 
+        // Create the reporter and, when an indexer is configured, a backfill
+        // queue of finalized digests so block uploads can resume after
+        // restarts.
+        let (app, pusher, consumer) = if let Some(indexer) = cfg.indexer {
+            let queue = queue::shared::init(
+                context.with_label("queue"),
+                queue::Config {
+                    partition: format!("{}-finalized-queue", cfg.partition_prefix),
+                    items_per_section: QUEUE_ITEMS_PER_SECTION,
+                    compression: None,
+                    codec_config: (),
+                    page_cache: page_cache.clone(),
+                    write_buffer: WRITE_BUFFER,
+                },
+            )
+            .await
+            .expect("failed to initialize finalized queue");
+            let indexer = indexer::Indexer::new(
+                context.with_label("indexer"),
+                indexer,
+                marshal_mailbox.clone(),
+                queue,
+                cfg.backfiller_max_active,
+                cfg.backfiller_retry,
+            )
+            .await;
+            let (producer, pusher, consumer) = indexer.split();
+            let app = Application::new().with_backfiller(producer);
+            (app, Some(pusher), Some(consumer))
+        } else {
+            (Application::new(), None, None)
+        };
+
         // Create the application
-        let app = Application::new();
         let marshaled = Marshaled::new(
             context.with_label("marshaled"),
             app,
@@ -275,18 +312,8 @@ where
             epocher,
         );
 
-        // Create the reporter
-        let reporter = (
-            marshal_mailbox.clone(),
-            cfg.indexer.map(|indexer| {
-                indexer::Pusher::new(
-                    context.with_label("indexer"),
-                    indexer,
-                    marshal_mailbox.clone(),
-                )
-            }),
-        )
-            .into();
+        // Create the reporter.
+        let reporter = (marshal_mailbox.clone(), pusher).into();
 
         // Create the consensus engine
         let consensus = Consensus::new(
@@ -324,6 +351,8 @@ where
             marshal,
             marshaled,
             consensus,
+
+            consumer,
         }
     }
 
@@ -391,6 +420,10 @@ where
             .marshal
             .start(self.marshaled, self.buffer_mailbox, marshal);
 
+        // Start draining queued block uploads before consensus so recovered work
+        // resumes immediately on startup.
+        let consumer_handle = self.consumer.map(indexer::Consumer::start);
+
         // Start consensus
         //
         // We start the application prior to consensus to ensure we can handle enqueued events from consensus (otherwise
@@ -398,7 +431,11 @@ where
         let consensus_handle = self.consensus.start(pending, recovered, resolver);
 
         // Wait for any actor to finish
-        if let Err(e) = try_join_all(vec![buffer_handle, marshal_handle, consensus_handle]).await {
+        let mut handles: Vec<Handle<()>> = vec![buffer_handle, marshal_handle, consensus_handle];
+        if let Some(h) = consumer_handle {
+            handles.push(h);
+        }
+        if let Err(e) = try_join_all(handles).await {
             error!(?e, "engine failed");
         } else {
             warn!("engine stopped");
