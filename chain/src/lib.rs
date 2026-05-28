@@ -1,6 +1,10 @@
-use commonware_utils::NZUsize;
+use commonware_utils::{NZUsize, NZU32};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, net::SocketAddr, num::NonZeroUsize};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    num::{NonZeroU32, NonZeroUsize},
+};
 
 pub mod application;
 pub mod engine;
@@ -9,6 +13,9 @@ pub mod utils;
 
 pub const DEFAULT_BACKFILLER_MAX_ACTIVE: NonZeroUsize = NZUsize!(16);
 pub const DEFAULT_BACKFILLER_RETRY_MS: u64 = 1_000;
+pub const DEFAULT_BLOCKING_THREADS: usize = 512;
+pub const DEFAULT_STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(16_384);
+pub const DEFAULT_NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(4_096);
 
 fn default_backfiller_max_active() -> NonZeroUsize {
     DEFAULT_BACKFILLER_MAX_ACTIVE
@@ -16,6 +23,18 @@ fn default_backfiller_max_active() -> NonZeroUsize {
 
 fn default_backfiller_retry_ms() -> u64 {
     DEFAULT_BACKFILLER_RETRY_MS
+}
+
+fn default_blocking_threads() -> usize {
+    DEFAULT_BLOCKING_THREADS
+}
+
+fn default_storage_buffer_pool_max_per_class() -> Option<NonZeroU32> {
+    Some(DEFAULT_STORAGE_BUFFER_POOL_MAX_PER_CLASS)
+}
+
+fn default_network_buffer_pool_max_per_class() -> Option<NonZeroU32> {
+    Some(DEFAULT_NETWORK_BUFFER_POOL_MAX_PER_CLASS)
 }
 
 /// Configuration for the [engine::Engine].
@@ -29,6 +48,16 @@ pub struct Config {
     pub metrics_port: u16,
     pub directory: String,
     pub worker_threads: usize,
+    #[serde(default = "default_blocking_threads")]
+    pub blocking_threads: usize,
+    #[serde(default = "default_storage_buffer_pool_max_per_class")]
+    pub storage_buffer_pool_max_per_class: Option<NonZeroU32>,
+    #[serde(default = "default_network_buffer_pool_max_per_class")]
+    pub network_buffer_pool_max_per_class: Option<NonZeroU32>,
+    #[serde(default)]
+    pub storage_buffer_pool_parallelism: Option<NonZeroUsize>,
+    #[serde(default)]
+    pub network_buffer_pool_parallelism: Option<NonZeroUsize>,
     pub log_level: String,
 
     pub local: bool,
@@ -67,7 +96,7 @@ mod tests {
     };
     use commonware_cryptography::{
         bls12381::primitives::variant::MinSig, certificate::mocks::Fixture, ed25519::PublicKey,
-        Signer,
+        Digestible, Signer,
     };
     use commonware_macros::{select, test_traced};
     use commonware_p2p::{
@@ -77,9 +106,9 @@ mod tests {
     use commonware_parallel::Sequential;
     use commonware_runtime::{
         deterministic::{self, Runner},
-        Clock, Metrics, Runner as _, Spawner,
+        Clock, Metrics, Runner as _, Spawner, Supervisor as _,
     };
-    use commonware_utils::{channel::oneshot, ordered::Set, NZU32};
+    use commonware_utils::{channel::oneshot, ordered::Set, NZUsize, NZU32};
     use engine::{Config, Engine};
     use governor::Quota;
     use indexer::mocks;
@@ -101,8 +130,7 @@ mod tests {
     ) -> HashMap<PublicKey, Registration> {
         oracle
             .manager()
-            .track(0, Set::from_iter_dedup(validators.iter().cloned()))
-            .await;
+            .track(0, Set::from_iter_dedup(validators.iter().cloned()));
         let mut registrations = HashMap::new();
         for validator in validators.iter() {
             let oracle = oracle.control(validator.clone());
@@ -174,17 +202,7 @@ mod tests {
         metrics
             .lines()
             .filter_map(|line| {
-                if !line.starts_with("validator_") {
-                    return None;
-                }
-                let mut parts = line.split_whitespace();
-                let metric = parts.next()?;
-                let value = parts.next()?;
-                let (name, labels) = metric
-                    .split_once('{')
-                    .map_or((metric, None), |(name, labels)| {
-                        (name, Some(labels.trim_end_matches('}')))
-                    });
+                let (name, labels, value) = validator_metric_sample(line)?;
                 if !name.ends_with(suffix) {
                     return None;
                 }
@@ -200,6 +218,25 @@ mod tests {
                 Some(value.parse::<T>().unwrap())
             })
             .sum()
+    }
+
+    fn validator_metric_sample(line: &str) -> Option<(&str, Option<&str>, &str)> {
+        let line = line.trim();
+        if line.starts_with('#') {
+            return None;
+        }
+        let mut parts = line.split_whitespace();
+        let metric = parts.next()?;
+        let value = parts.next()?;
+        let (name, labels) = metric
+            .split_once('{')
+            .map_or((metric, None), |(name, labels)| {
+                (name, Some(labels.trim_end_matches('}')))
+            });
+        if !name.starts_with("validator_") {
+            return None;
+        }
+        Some((name, labels, value))
     }
 
     fn queue_outstanding(metrics: &str) -> i64 {
@@ -318,13 +355,13 @@ mod tests {
             indexer: cfg.indexer,
             strategy: Sequential,
         };
-        let validator_context = context.with_label(&uid);
+        let validator_context = context.child("validator").with_attribute("id", &uid);
         let (pending, recovered, resolver, broadcast, backfill) = registration;
         let marshal_resolver_cfg = marshal::resolver::p2p::Config {
             public_key: public_key.clone(),
             peer_provider: oracle.manager(),
             blocker: oracle.control(public_key.clone()),
-            mailbox_size: 1024,
+            mailbox_size: NZUsize!(1024),
             initial: Duration::from_secs(1),
             timeout: Duration::from_secs(2),
             fetch_retry_timeout: Duration::from_millis(100),
@@ -332,11 +369,11 @@ mod tests {
             priority_responses: false,
         };
         let marshal_resolver = marshal::resolver::p2p::init(
-            &validator_context.with_label("backfill"),
+            validator_context.child("backfill"),
             marshal_resolver_cfg,
             backfill,
         );
-        let engine = Engine::new(validator_context.with_label("engine"), config).await;
+        let engine = Engine::new(validator_context.child("engine"), config).await;
         engine.start(pending, recovered, resolver, broadcast, marshal_resolver);
     }
 
@@ -345,12 +382,9 @@ mod tests {
             let metrics = context.encode();
             let mut success = false;
             for line in metrics.lines() {
-                if !line.starts_with("validator_") {
+                let Some((metric, _, value)) = validator_metric_sample(line) else {
                     continue;
-                }
-                let mut parts = line.split_whitespace();
-                let metric = parts.next().unwrap();
-                let value = parts.next().unwrap();
+                };
                 if metric.ends_with("_peers_blocked") {
                     let value = value.parse::<u64>().unwrap();
                     assert_eq!(value, 0);
@@ -375,11 +409,11 @@ mod tests {
         let executor = Runner::from(cfg);
         executor.start(|mut context| async move {
             let (network, mut oracle) = Network::new(
-                context.with_label("network"),
+                context.child("network"),
                 simulated::Config {
                     max_size: 1024 * 1024,
                     disconnect_on_block: true,
-                    tracked_peer_sets: Some(1),
+                    tracked_peer_sets: NZUsize!(1),
                 },
             );
             network.start();
@@ -458,11 +492,11 @@ mod tests {
         let executor = Runner::timed(Duration::from_secs(30));
         executor.start(|mut context| async move {
             let (network, mut oracle) = Network::new(
-                context.with_label("network"),
+                context.child("network"),
                 simulated::Config {
                     max_size: 1024 * 1024,
                     disconnect_on_block: true,
-                    tracked_peer_sets: Some(1),
+                    tracked_peer_sets: NZUsize!(1),
                 },
             );
             network.start();
@@ -558,11 +592,11 @@ mod tests {
             let f = |mut context: deterministic::Context| async move {
                 // Create simulated network
                 let (network, mut oracle) = Network::new(
-                    context.with_label("network"),
+                    context.child("network"),
                     simulated::Config {
                         max_size: 1024 * 1024,
                         disconnect_on_block: true,
-                        tracked_peer_sets: Some(1),
+                        tracked_peer_sets: NZUsize!(1),
                     },
                 );
 
@@ -603,48 +637,40 @@ mod tests {
                     .await;
                 }
 
-                let poller = context
-                    .with_label("metrics")
-                    .spawn(move |context| async move {
-                        loop {
-                            let metrics = context.encode();
+                let poller = context.child("metrics").spawn(move |context| async move {
+                    loop {
+                        let metrics = context.encode();
 
-                            // Iterate over all lines
-                            let mut success = false;
-                            for line in metrics.lines() {
-                                // Ensure it is a metrics line
-                                if !line.starts_with("validator_") {
-                                    continue;
-                                }
+                        // Iterate over all lines
+                        let mut success = false;
+                        for line in metrics.lines() {
+                            let Some((metric, _, value)) = validator_metric_sample(line) else {
+                                continue;
+                            };
 
-                                // Split metric and value
-                                let mut parts = line.split_whitespace();
-                                let metric = parts.next().unwrap();
-                                let value = parts.next().unwrap();
-
-                                // If ends with peers_blocked, ensure it is zero
-                                if metric.ends_with("_peers_blocked") {
-                                    let value = value.parse::<u64>().unwrap();
-                                    assert_eq!(value, 0);
-                                }
-
-                                // If ends with contiguous_height, ensure it is at least required_container
-                                if metric.ends_with("_marshal_processed_height") {
-                                    let value = value.parse::<u64>().unwrap();
-                                    if value >= required_container {
-                                        success = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if success {
-                                break;
+                            // If ends with peers_blocked, ensure it is zero
+                            if metric.ends_with("_peers_blocked") {
+                                let value = value.parse::<u64>().unwrap();
+                                assert_eq!(value, 0);
                             }
 
-                            // Still waiting for all validators to complete
-                            context.sleep(Duration::from_millis(10)).await;
+                            // If ends with contiguous_height, ensure it is at least required_container
+                            if metric.ends_with("_marshal_processed_height") {
+                                let value = value.parse::<u64>().unwrap();
+                                if value >= required_container {
+                                    success = true;
+                                    break;
+                                }
+                            }
                         }
-                    });
+                        if success {
+                            break;
+                        }
+
+                        // Still waiting for all validators to complete
+                        context.sleep(Duration::from_millis(10)).await;
+                    }
+                });
 
                 // Exit at random points until finished
                 let wait =
@@ -693,11 +719,11 @@ mod tests {
         executor.start(|mut context| async move {
             // Create simulated network
             let (network, mut oracle) = Network::new(
-                context.with_label("network"),
+                context.child("network"),
                 simulated::Config {
                     max_size: 1024 * 1024,
                     disconnect_on_block: true,
-                    tracked_peer_sets: Some(1),
+                    tracked_peer_sets: NZUsize!(1),
                 },
             );
 
@@ -751,12 +777,19 @@ mod tests {
             assert!(indexer
                 .finalization_seen
                 .load(std::sync::atomic::Ordering::Relaxed));
+            let genesis_digest = application::Application::genesis().digest();
+            let started_digests = indexer.block_upload_started_digests.lock().clone();
+            let expected_genesis_uploads = n as usize;
             assert_eq!(
-                indexer
-                    .block_upload_started
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                0,
-                "block uploads should stay idle when certified uploads succeed",
+                started_digests.len(),
+                expected_genesis_uploads,
+                "only genesis should be uploaded as a bare block when certified uploads succeed",
+            );
+            assert!(
+                started_digests
+                    .iter()
+                    .all(|digest| *digest == genesis_digest),
+                "non-genesis block uploads should stay idle when certified uploads succeed",
             );
         });
     }
@@ -768,11 +801,11 @@ mod tests {
         let executor = Runner::timed(Duration::from_secs(30));
         executor.start(|mut context| async move {
             let (network, mut oracle) = Network::new(
-                context.with_label("network"),
+                context.child("network"),
                 simulated::Config {
                     max_size: 1024 * 1024,
                     disconnect_on_block: true,
-                    tracked_peer_sets: Some(1),
+                    tracked_peer_sets: NZUsize!(1),
                 },
             );
             network.start();
@@ -851,11 +884,11 @@ mod tests {
         let executor = Runner::timed(Duration::from_secs(30));
         executor.start(|mut context| async move {
             let (network, mut oracle) = Network::new(
-                context.with_label("network"),
+                context.child("network"),
                 simulated::Config {
                     max_size: 1024 * 1024,
                     disconnect_on_block: true,
-                    tracked_peer_sets: Some(1),
+                    tracked_peer_sets: NZUsize!(1),
                 },
             );
             network.start();
@@ -927,12 +960,17 @@ mod tests {
                 queue_outstanding(&metrics) > 0,
                 "expected finalized queue work while certificate uploads were blocked",
             );
+            let genesis_digest = application::Application::genesis().digest();
+            let expected_genesis_uploads = n as usize;
+            let started_digests = indexer.block_upload_started_digests.lock().clone();
             assert_eq!(
-                indexer
-                    .block_upload_started
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                0,
-                "block uploads should wait while certificate uploads are still in flight",
+                started_digests.len(),
+                expected_genesis_uploads,
+                "only genesis should be uploaded as a bare block while certificate uploads are in flight",
+            );
+            assert!(
+                started_digests.iter().all(|digest| *digest == genesis_digest),
+                "non-genesis block uploads should wait while certificate uploads are still in flight",
             );
 
             // Release the blocked certificate uploads and confirm the
@@ -952,12 +990,15 @@ mod tests {
             assert!(indexer
                 .finalization_seen
                 .load(std::sync::atomic::Ordering::Relaxed));
+            let started_digests = indexer.block_upload_started_digests.lock().clone();
             assert_eq!(
-                indexer
-                    .block_upload_started
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                0,
-                "block uploads should remain idle when certificate uploads eventually succeed",
+                started_digests.len(),
+                expected_genesis_uploads,
+                "only genesis should be uploaded as a bare block when certificate uploads eventually succeed",
+            );
+            assert!(
+                started_digests.iter().all(|digest| *digest == genesis_digest),
+                "non-genesis block uploads should remain idle when certificate uploads eventually succeed",
             );
         });
     }
@@ -968,11 +1009,11 @@ mod tests {
         let executor = Runner::timed(Duration::from_secs(30));
         executor.start(|mut context| async move {
             let (network, mut oracle) = Network::new(
-                context.with_label("network"),
+                context.child("network"),
                 simulated::Config {
                     max_size: 1024 * 1024,
                     disconnect_on_block: true,
-                    tracked_peer_sets: Some(1),
+                    tracked_peer_sets: NZUsize!(1),
                 },
             );
             network.start();
@@ -1154,11 +1195,11 @@ mod tests {
             let indexer = first_run_indexer.clone();
             async move {
                 let (network, mut oracle) = Network::new(
-                    context.with_label("network"),
+                    context.child("network"),
                     simulated::Config {
                         max_size: 1024 * 1024,
                         disconnect_on_block: true,
-                        tracked_peer_sets: Some(1),
+                        tracked_peer_sets: NZUsize!(1),
                     },
                 );
                 network.start();
@@ -1278,11 +1319,11 @@ mod tests {
             let indexer = second_run_indexer.clone();
             let expected_digests = expected_digests_for_recovery.clone();
             let (network, mut oracle) = Network::new(
-                context.with_label("network"),
+                context.child("network"),
                 simulated::Config {
                     max_size: 1024 * 1024,
                     disconnect_on_block: true,
-                    tracked_peer_sets: Some(1),
+                    tracked_peer_sets: NZUsize!(1),
                 },
             );
             network.start();

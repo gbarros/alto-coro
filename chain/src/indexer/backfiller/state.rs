@@ -196,6 +196,19 @@ mod tests {
     }
 
     #[test]
+    fn test_upload_state_records_genesis() {
+        let mut uploads = State::new();
+        let genesis = test_block(0, 0, b"genesis");
+        let digest = genesis.digest();
+
+        let entry = uploads.record(&genesis).expect("missing genesis entry");
+
+        assert_eq!(entry.height, 0);
+        assert_eq!(entry.digest, digest);
+        assert_eq!(uploads.cached_block(&digest).as_ref(), Some(&genesis));
+    }
+
+    #[test]
     fn test_upload_state_prunes_only_after_queue_floor_progress() {
         let mut uploads = State::new();
 

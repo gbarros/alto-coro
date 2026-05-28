@@ -1,465 +1,136 @@
 use crate::Source;
-use alto_client::consensus::Payload;
-use alto_client::{IndexQuery, Query};
+use alto_client::{consensus::Payload, IndexQuery, Query};
 use bytes::Bytes;
 use commonware_codec::Encode;
-use commonware_consensus::{marshal::resolver::handler, types::Height};
+use commonware_consensus::{
+    marshal::resolver::handler,
+    types::{Height, Round},
+};
 use commonware_cryptography::{ed25519::PublicKey, sha256::Digest};
-use commonware_macros::select_loop;
-use commonware_resolver::Consumer;
-use commonware_runtime::{spawn_cell, Clock, ContextCell, Handle, Spawner};
-use commonware_utils::channel::mpsc;
-use commonware_utils::{
-    futures::{AbortablePool, Aborter},
-    vec::NonEmptyVec,
-    SystemTimeExt,
-};
-use rand::{CryptoRng, RngCore};
-use std::{
-    collections::{BTreeSet, HashMap},
-    time::{Duration, SystemTime},
-};
-use tracing::{debug, trace, warn};
+use commonware_resolver::opaque;
+use commonware_runtime::{Clock, Metrics, Spawner};
+use std::{future::Future, num::NonZeroUsize, time::Duration};
+use tracing::{debug, warn};
 
-/// Messages sent from the [Resolver] handle to the [Actor].
-#[allow(clippy::type_complexity)]
-pub enum Message {
-    Fetch(handler::Request<Digest>),
-    Cancel(handler::Request<Digest>),
-    Clear,
-    Retain(Box<dyn Fn(&handler::Request<Digest>) -> bool + Send>),
-}
+type Key = handler::Key<Digest>;
+type Subscriber = handler::Annotation;
+pub type Resolver = opaque::Resolver<Key, Subscriber, PublicKey>;
 
-/// Handle to the [Actor] that implements [Resolver] for marshal.
-///
-/// All operations are forwarded as messages to the actor via a channel.
-#[derive(Clone)]
-pub struct Resolver {
-    mailbox_tx: mpsc::Sender<Message>,
-}
-
-impl commonware_resolver::Resolver for Resolver {
-    type Key = handler::Request<Digest>;
-    type PublicKey = PublicKey;
-
-    async fn fetch(&mut self, key: Self::Key) {
-        let msg = Message::Fetch(key);
-        if let Err(e) = self.mailbox_tx.send(msg).await {
-            warn!(error = ?e, "failed to send fetch request to resolver actor");
-        }
-    }
-
-    async fn fetch_all(&mut self, keys: Vec<Self::Key>) {
-        for key in keys {
-            self.fetch(key).await;
-        }
-    }
-
-    async fn fetch_targeted(&mut self, key: Self::Key, _targets: NonEmptyVec<Self::PublicKey>) {
-        self.fetch(key).await;
-    }
-
-    async fn fetch_all_targeted(
-        &mut self,
-        requests: Vec<(Self::Key, NonEmptyVec<Self::PublicKey>)>,
-    ) {
-        for (key, _) in requests {
-            self.fetch(key).await;
-        }
-    }
-
-    async fn cancel(&mut self, key: Self::Key) {
-        let msg = Message::Cancel(key);
-        if let Err(e) = self.mailbox_tx.send(msg).await {
-            warn!(error = ?e, "failed to send cancel request to resolver actor");
-        }
-    }
-
-    async fn clear(&mut self) {
-        let msg = Message::Clear;
-        if let Err(e) = self.mailbox_tx.send(msg).await {
-            warn!(error = ?e, "failed to send clear request to resolver actor");
-        }
-    }
-
-    async fn retain(&mut self, f: impl Fn(&Self::Key) -> bool + Send + 'static) {
-        let msg = Message::Retain(Box::new(f));
-        if let Err(e) = self.mailbox_tx.send(msg).await {
-            warn!(error = ?e, "failed to send retain request to resolver actor");
-        }
-    }
-}
-
-/// Actor that fetches blocks and certificates from a [Source] on behalf of marshal.
-///
-/// This replaces the p2p-based resolver used by validators. When marshal needs
-/// a block or certificate it does not have locally, it asks this actor to fetch
-/// it from the HTTP source.
-///
-/// The [Source] (client) should be constructed without verification because marshal's
-/// Deliver handler verifies all signatures before accepting resolved data.
-/// Rejections are logged as warnings and retried.
-pub struct Actor<E: Spawner, C: Source> {
-    context: ContextCell<E>,
+/// Start the follower resolver and marshal handler backed by `client`.
+pub fn init<E, C>(
+    context: E,
     client: C,
-    mailbox_rx: mpsc::Receiver<Message>,
-    handler: handler::Handler<Digest>,
-    active: AbortablePool<Result>,
-    requests: HashMap<handler::Request<Digest>, State>,
-    retry_schedule: BTreeSet<(SystemTime, handler::Request<Digest>)>,
+    mailbox_size: NonZeroUsize,
     fetch_retry_timeout: Duration,
-    next_id: u64,
+) -> (handler::Receiver<Digest>, Resolver)
+where
+    E: Clock + Spawner + Metrics,
+    C: Source,
+{
+    let (handler_rx, handler) = handler::init(context.child("handler"), mailbox_size);
+    let resolver = opaque::init::<_, _, _, PublicKey>(
+        context.child("resolver"),
+        Fetcher::new(client),
+        handler,
+        mailbox_size,
+        fetch_retry_timeout,
+    );
+    (handler_rx, resolver)
 }
 
-enum State {
-    // A fetch is currently running.
-    //
-    // The id lets us ignore stale completions from an earlier attempt for
-    // the same key, and dropping the aborter cancels the current attempt.
-    // This ensures we only have 1 fetch in flight for a given key (regardless
-    // of the order of fetch, cancel, clear, retain messages).
-    Active { id: u64, aborter: Aborter },
-    // A retry is queued for the recorded deadline.
-    Scheduled(SystemTime),
+/// Fetches and encodes marshal resolver payloads from an Alto source client.
+#[derive(Clone)]
+struct Fetcher<C>(C);
+
+impl<C> Fetcher<C> {
+    const fn new(client: C) -> Self {
+        Self(client)
+    }
 }
 
-struct Result {
-    key: handler::Request<Digest>,
-    id: u64,
-    retry: bool,
+impl<C> opaque::Fetcher for Fetcher<C>
+where
+    C: Source,
+{
+    type Key = Key;
+    type Value = Bytes;
+
+    fn fetch(&self, key: Self::Key) -> impl Future<Output = Option<Self::Value>> + Send {
+        let client = self.0.clone();
+        async move {
+            match key {
+                handler::Key::Block(digest) => Self::fetch_block_by_digest(digest, client).await,
+                handler::Key::Finalized { height } => {
+                    Self::fetch_finalized_by_height(height, client).await
+                }
+                handler::Key::Notarized { round } => {
+                    Self::fetch_notarized_by_round(round, client).await
+                }
+            }
+        }
+    }
 }
 
-impl<E: Spawner + Clock + CryptoRng + RngCore, C: Source> Actor<E, C> {
-    /// Create a new [Actor] and its corresponding [Resolver] handle.
-    pub fn new(
-        context: E,
-        client: C,
-        ingress_tx: mpsc::Sender<handler::Message<Digest>>,
-        mailbox_size: usize,
-        fetch_retry_timeout: Duration,
-    ) -> (Self, Resolver) {
-        let (mailbox_tx, mailbox_rx) = mpsc::channel(mailbox_size);
-
-        let actor = Self {
-            context: ContextCell::new(context),
-            client,
-            mailbox_rx,
-            handler: handler::Handler::new(ingress_tx),
-            active: AbortablePool::default(),
-            requests: HashMap::new(),
-            retry_schedule: BTreeSet::new(),
-            fetch_retry_timeout,
-            next_id: 0,
-        };
-
-        let handle = Resolver { mailbox_tx };
-
-        (actor, handle)
-    }
-
-    /// Start the [Actor] in a background task.
-    pub fn start(mut self) -> Handle<()> {
-        spawn_cell!(self.context, self.run().await)
-    }
-
-    /// Run the actor loop, processing fetch/cancel/clear/retain messages.
-    async fn run(mut self) {
-        select_loop! {
-            self.context,
-            on_stopped => {},
-            Ok(result) = self.active.next_completed() else continue => {
-                self.handle_completed(result);
-            },
-            _ = match self.retry_schedule.first() {
-                Some((deadline, _)) => futures::future::Either::Left(self.context.sleep_until(*deadline)),
-                None => futures::future::Either::Right(futures::future::pending()),
-            } => {
-                self.process_retries();
-            },
-            Some(msg) = self.mailbox_rx.recv() else break => {
-                match msg {
-                    Message::Fetch(key) => {
-                        if let Some(state) = self.requests.get(&key) {
-                            match state {
-                                State::Active { .. } => {
-                                    trace!(?key, "ignoring fetch request for active key");
-                                }
-                                State::Scheduled(_) => {
-                                    trace!(?key, "ignoring fetch request for scheduled key");
-                                }
-                            }
-                            continue;
-                        }
-                        self.start_fetch(key);
-                    }
-                    Message::Cancel(key) => {
-                        if let Some(state) = self.requests.remove(&key) {
-                            match state {
-                                State::Active { aborter, .. } => {
-                                    drop(aborter);
-                                    debug!(?key, "cancelled active request");
-                                }
-                                State::Scheduled(deadline) => {
-                                    let removed = self.retry_schedule.remove(&(deadline, key.clone()));
-                                    assert!(removed, "scheduled retry entry missing");
-                                    debug!(?key, ?deadline, "cancelled scheduled request");
-                                }
-                            }
-                        }
-                    }
-                    Message::Clear => {
-                        let active = self
-                            .requests
-                            .values()
-                            .filter(|state| matches!(state, State::Active { .. }))
-                            .count();
-                        let scheduled = self.requests.len() - active;
-                        self.requests.clear();
-                        self.retry_schedule.clear();
-                        debug!(active, scheduled, "cleared all pending requests");
-                    }
-                    Message::Retain(f) => {
-                        let to_remove = self
-                            .requests
-                            .keys()
-                            .filter(|key| !f(key))
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let removed = to_remove.len();
-                        for key in to_remove {
-                            if let Some(State::Scheduled(deadline)) = self.requests.remove(&key) {
-                                let removed = self.retry_schedule.remove(&(deadline, key.clone()));
-                                assert!(removed, "scheduled retry entry missing");
-                            }
-                        }
-                        debug!(removed, remaining = self.requests.len(), "retained pending requests");
-                    }
-                }
-            },
-        }
-    }
-
-    /// Start a fetch for the given key.
-    fn start_fetch(&mut self, key: handler::Request<Digest>) {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        let future =
-            Self::process_fetch(key.clone(), id, self.client.clone(), self.handler.clone());
-        let aborter = self.active.push(future);
-        let previous = self.requests.insert(key, State::Active { id, aborter });
-        assert!(previous.is_none(), "request state already existed");
-    }
-
-    /// Handle a completed fetch.
-    fn handle_completed(&mut self, result: Result) {
-        // If the request has been removed or updated, ignore the completion.
-        let Some(state) = self.requests.get(&result.key) else {
-            trace!(
-                ?result.key,
-                id = result.id,
-                "ignoring stale fetch completion for removed request"
-            );
-            return;
-        };
-        match state {
-            State::Active { id, .. } if *id == result.id => {}
-            State::Active { id, .. } => {
-                trace!(
-                    ?result.key,
-                    completed_id = result.id,
-                    active_id = *id,
-                    "ignoring stale fetch completion for replaced request"
-                );
-                return;
-            }
-            State::Scheduled(deadline) => {
-                trace!(
-                    ?result.key,
-                    id = result.id,
-                    ?deadline,
-                    "ignoring stale fetch completion for scheduled request"
-                );
-                return;
-            }
-        }
-
-        // Remove the request and (optionally) schedule a retry.
-        let removed = self.requests.remove(&result.key);
-        assert!(
-            matches!(
-                removed,
-                Some(State::Active { id, .. }) if id == result.id
-            ),
-            "active request state missing for completed fetch"
-        );
-        if result.retry {
-            self.schedule_retry(result.key);
-        }
-    }
-
-    /// Schedule a retry for the given key.
-    fn schedule_retry(&mut self, key: handler::Request<Digest>) {
-        let deadline = self
-            .context
-            .current()
-            .add_jittered(&mut self.context, self.fetch_retry_timeout);
-        let previous = self
-            .requests
-            .insert(key.clone(), State::Scheduled(deadline));
-        assert!(
-            matches!(previous, None | Some(State::Active { .. })),
-            "request was already scheduled"
-        );
-        self.retry_schedule.insert((deadline, key.clone()));
-        debug!(?key, ?deadline, "scheduled fetch retry");
-    }
-
-    /// Process any due retries.
-    fn process_retries(&mut self) {
-        let now = self.context.current();
-        while let Some((deadline, key)) = self.retry_schedule.pop_first() {
-            if deadline > now {
-                self.retry_schedule.insert((deadline, key));
-                break;
-            }
-            match self.requests.get(&key) {
-                Some(State::Scheduled(state_deadline)) if *state_deadline == deadline => {
-                    self.requests.remove(&key);
-                    debug!(?key, "retrying fetch request");
-                    self.start_fetch(key);
-                }
-                Some(State::Active { .. }) => {
-                    trace!(
-                        ?key,
-                        "skipping stale retry because request is already in flight"
-                    );
-                }
-                Some(State::Scheduled(state_deadline)) => {
-                    trace!(
-                        ?key,
-                        ?deadline,
-                        ?state_deadline,
-                        "skipping stale retry with outdated deadline"
-                    );
-                }
-                None => {
-                    trace!(?key, ?deadline, "skipping stale retry for removed request");
-                }
-            }
-        }
-    }
-
-    /// Process a fetch request.
-    async fn process_fetch(
-        key: handler::Request<Digest>,
-        id: u64,
-        client: C,
-        handler: handler::Handler<Digest>,
-    ) -> Result {
-        let retry = match &key {
-            handler::Request::Block(digest) => {
-                Self::fetch_block_by_digest(*digest, client, handler).await
-            }
-            handler::Request::Finalized { height } => {
-                Self::fetch_finalized_by_height(*height, client, handler).await
-            }
-            handler::Request::Notarized { round } => {
-                Self::fetch_notarized_by_round(*round, client, handler).await
-            }
-        };
-        Result { key, id, retry }
-    }
-
-    /// Fetch a block by digest.
-    async fn fetch_block_by_digest(
-        digest: Digest,
-        client: C,
-        mut handler: handler::Handler<Digest>,
-    ) -> bool {
+impl<C> Fetcher<C>
+where
+    C: Source,
+{
+    /// Fetch and encode a block response by digest.
+    async fn fetch_block_by_digest(digest: Digest, client: C) -> Option<Bytes> {
         debug!(?digest, "fetching block by digest");
-
-        match client.block(alto_client::Query::Digest(digest)).await {
-            Ok(Payload::Block(block)) => {
-                let key = handler::Request::Block(digest);
-                let value = Bytes::from(block.encode().to_vec());
-                if !handler.deliver(key, value).await {
-                    warn!(?digest, "failed to deliver block to marshal");
-                    return true;
-                }
-                debug!(?digest, "fetched block by digest");
-                false
-            }
+        match client.block(Query::Digest(digest)).await {
+            Ok(Payload::Block(block)) => Some(Bytes::from(block.encode().to_vec())),
             Ok(_) => {
                 warn!(?digest, "wrong payload returned for block by digest");
-                true
+                None
             }
-            Err(e) => {
-                warn!(?digest, error=?e, "failed to fetch block by digest");
-                true
+            Err(error) => {
+                warn!(?digest, ?error, "failed to fetch block by digest");
+                None
             }
         }
     }
 
-    /// Fetch a finalized block by height.
-    async fn fetch_finalized_by_height(
-        height: Height,
-        client: C,
-        mut handler: handler::Handler<Digest>,
-    ) -> bool {
+    /// Fetch and encode a finalization plus block by finalized height.
+    async fn fetch_finalized_by_height(height: Height, client: C) -> Option<Bytes> {
         debug!(height = height.get(), "fetching finalized block by height");
-
         match client.block(Query::Index(height.get())).await {
-            Ok(Payload::Finalized(finalized)) => {
-                let key = handler::Request::Finalized { height };
-                let finalization = finalized.proof.clone();
-                let block = finalized.block.clone();
-                let value = Bytes::from((finalization, block).encode().to_vec());
-                if !handler.deliver(key, value).await {
-                    warn!(height = height.get(), "marshal rejected finalized block");
-                    return true;
-                }
-                debug!(height = height.get(), "fetched finalized block by height");
-                false
-            }
+            Ok(Payload::Finalized(finalized)) => Some(Bytes::from(
+                (finalized.proof.clone(), finalized.block.clone())
+                    .encode()
+                    .to_vec(),
+            )),
             Ok(_) => {
                 warn!(
                     height = height.get(),
                     "wrong payload returned for finalized block by height"
                 );
-                true
+                None
             }
-            Err(e) => {
-                warn!(height = height.get(), error=?e, "failed to fetch finalized block by height");
-                true
+            Err(error) => {
+                warn!(
+                    height = height.get(),
+                    ?error,
+                    "failed to fetch finalized block by height"
+                );
+                None
             }
         }
     }
 
-    /// Fetch a notarized block by round.
-    async fn fetch_notarized_by_round(
-        round: commonware_consensus::types::Round,
-        client: C,
-        mut handler: handler::Handler<Digest>,
-    ) -> bool {
+    /// Fetch and encode a notarization plus block by consensus round.
+    async fn fetch_notarized_by_round(round: Round, client: C) -> Option<Bytes> {
         let view = round.view().get();
         debug!(view, "fetching notarized block by round");
-
         match client.notarized(IndexQuery::Index(view)).await {
-            Ok(notarized) => {
-                let key = handler::Request::Notarized { round };
-                let notarization = notarized.proof.clone();
-                let block = notarized.block.clone();
-                let value = Bytes::from((notarization, block).encode().to_vec());
-                if !handler.deliver(key, value).await {
-                    warn!(view, "marshal rejected notarized block");
-                    return true;
-                }
-                debug!(view, "fetched notarized block by round");
-                false
-            }
-            Err(e) => {
-                warn!(view, error=?e, "failed to fetch notarized block by round");
-                true
+            Ok(notarized) => Some(Bytes::from(
+                (notarized.proof.clone(), notarized.block.clone())
+                    .encode()
+                    .to_vec(),
+            )),
+            Err(error) => {
+                warn!(view, ?error, "failed to fetch notarized block by round");
+                None
             }
         }
     }
@@ -468,493 +139,625 @@ impl<E: Spawner + Clock + CryptoRng + RngCore, C: Source> Actor<E, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{MockSource, TestFixture};
-    use alto_client::{consensus::Payload, Query};
-    use commonware_consensus::{
-        marshal::resolver::handler,
-        types::{Height, Round, View},
-    };
-    use commonware_cryptography::{sha256::Digest, Digestible};
+    use crate::test_utils::{MockError, MockSource, TestFixture};
+    use alto_client::Query;
+    use commonware_cryptography::{ed25519::PrivateKey, Digestible, Signer};
     use commonware_macros::test_traced;
-    use commonware_resolver::Resolver as _;
-    use commonware_runtime::{deterministic::Runner, Clock, Metrics, Runner as _};
-    use commonware_utils::channel::mpsc;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use commonware_resolver::{Consumer, Delivery, Resolver as _, TargetedResolver as _};
+    use commonware_runtime::{deterministic, Clock, Runner as _, Supervisor as _};
+    use commonware_utils::{channel::oneshot, sync::Mutex, vec::NonEmptyVec, NZUsize};
+    use futures::stream;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc,
+        },
+    };
 
     const DEFAULT_FETCH_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 
-    /// Exercises the full Resolver trait surface (fetch, cancel, clear,
-    /// retain) to ensure messages reach the actor without error.
-    #[test_traced]
-    fn fetch_cancel_clear_retain() {
-        Runner::default().start(|context| async move {
-            let source = MockSource::new();
-            let (ingress_tx, _ingress_rx) = mpsc::channel(16);
-            let (actor, mut resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx,
-                16,
-                DEFAULT_FETCH_RETRY_TIMEOUT,
-            );
-            let _actor_handle = actor.start();
-
-            let key = handler::Request::<Digest>::Finalized {
-                height: Height::new(1),
-            };
-
-            resolver.fetch(key.clone()).await;
-            resolver.cancel(key).await;
-            resolver.clear().await;
-            resolver.retain(|_| true).await;
-
-            // Allow the actor to process all queued messages
-            context.sleep(Duration::from_millis(100)).await;
-        });
+    struct CapturedDelivery {
+        delivery: Delivery<Key, Subscriber>,
+        value: Bytes,
+        response: oneshot::Sender<bool>,
     }
 
-    /// Verifies that the actor fetches a block by digest from the source
-    /// and delivers it to marshal's ingress channel.
+    #[derive(Clone, Default)]
+    struct TestConsumer {
+        deliveries: Arc<Mutex<VecDeque<CapturedDelivery>>>,
+    }
+
+    impl TestConsumer {
+        fn pop(&self) -> Option<CapturedDelivery> {
+            self.deliveries.lock().pop_front()
+        }
+
+        fn len(&self) -> usize {
+            self.deliveries.lock().len()
+        }
+    }
+
+    impl Consumer for TestConsumer {
+        type Key = Key;
+        type Value = Bytes;
+        type Subscriber = Subscriber;
+
+        fn deliver(
+            &mut self,
+            delivery: Delivery<Self::Key, Self::Subscriber>,
+            value: Self::Value,
+        ) -> oneshot::Receiver<bool> {
+            let (response, receiver) = oneshot::channel();
+            self.deliveries.lock().push_back(CapturedDelivery {
+                delivery,
+                value,
+                response,
+            });
+            receiver
+        }
+    }
+
+    struct DropSignal(Arc<Mutex<Option<oneshot::Sender<()>>>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.lock().take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingSource {
+        started: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        dropped: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    }
+
+    impl BlockingSource {
+        fn new() -> (Self, oneshot::Receiver<()>, oneshot::Receiver<()>) {
+            let (started_tx, started_rx) = oneshot::channel();
+            let (dropped_tx, dropped_rx) = oneshot::channel();
+            (
+                Self {
+                    started: Arc::new(Mutex::new(Some(started_tx))),
+                    dropped: Arc::new(Mutex::new(Some(dropped_tx))),
+                },
+                started_rx,
+                dropped_rx,
+            )
+        }
+    }
+
+    impl Source for BlockingSource {
+        type Error = MockError;
+
+        async fn health(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn block(&self, _query: Query) -> Result<Payload, Self::Error> {
+            if let Some(sender) = self.started.lock().take() {
+                let _ = sender.send(());
+            }
+            let _drop_signal = DropSignal(self.dropped.clone());
+            std::future::pending::<Result<Payload, Self::Error>>().await
+        }
+
+        async fn notarized(
+            &self,
+            _query: IndexQuery,
+        ) -> Result<alto_types::Notarized, Self::Error> {
+            Err(MockError("notarized not supported".to_string()))
+        }
+
+        async fn finalized(
+            &self,
+            _query: IndexQuery,
+        ) -> Result<alto_types::Finalized, Self::Error> {
+            Err(MockError("finalized not supported".to_string()))
+        }
+
+        async fn listen(
+            &self,
+        ) -> Result<
+            impl futures::Stream<Item = Result<alto_client::consensus::Message, Self::Error>>
+                + Send
+                + Unpin,
+            Self::Error,
+        > {
+            Ok(stream::empty())
+        }
+    }
+
+    fn start_resolver<C: Source>(
+        context: deterministic::Context,
+        source: C,
+        consumer: TestConsumer,
+    ) -> Resolver {
+        opaque::init::<_, _, _, PublicKey>(
+            context,
+            Fetcher::new(source),
+            consumer,
+            NZUsize!(16),
+            DEFAULT_FETCH_RETRY_TIMEOUT,
+        )
+    }
+
+    async fn wait_for_delivery(
+        context: &deterministic::Context,
+        consumer: &TestConsumer,
+    ) -> CapturedDelivery {
+        for _ in 0..50 {
+            if let Some(delivery) = consumer.pop() {
+                return delivery;
+            }
+            context.sleep(Duration::from_millis(100)).await;
+        }
+        panic!("timed out waiting for delivery");
+    }
+
     #[test_traced]
     fn fetches_block_by_digest() {
         let fixture = TestFixture::new();
         let block = fixture.create_block(1, 1);
         let digest = block.digest();
 
-        // Configure the mock to return the block for any query
         let source = MockSource::new();
-        *source.block_handler.lock().unwrap() = Some(Box::new(move |_| {
+        *source.block_handler.lock() = Some(Box::new(move |_| {
             Some(Payload::Block(Box::new(block.clone())))
         }));
 
-        Runner::default().start(|context| async move {
-            let (ingress_tx, mut ingress_rx) = mpsc::channel(16);
-            let (actor, mut resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx,
-                16,
-                DEFAULT_FETCH_RETRY_TIMEOUT,
-            );
-            let _actor_handle = actor.start();
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
+            let height = Height::new(1);
 
-            // Verify the actor delivered the block with the correct key
-            resolver.fetch(handler::Request::Block(digest)).await;
-            let msg = ingress_rx.recv().await.unwrap();
-            match msg {
-                handler::Message::Deliver { key, .. } => {
-                    assert!(matches!(key, handler::Request::Block(d) if d == digest));
-                }
-                _ => panic!("expected Deliver message"),
-            }
+            assert!(resolver
+                .fetch(handler::Request::certified_block(digest, height))
+                .accepted());
+            let delivery = wait_for_delivery(&context, &consumer).await;
+
+            assert!(matches!(delivery.delivery.key, handler::Key::Block(d) if d == digest));
+            assert!(delivery
+                .delivery
+                .subscribers
+                .contains(&handler::Annotation::Certified { height }));
+            assert!(!delivery.value.is_empty());
+            delivery.response.send(true).expect("response dropped");
         });
     }
 
-    /// Verifies that the actor fetches a finalized block by height from
-    /// the source and delivers it to marshal's ingress channel.
-    #[test_traced]
-    fn fetches_finalized_by_height() {
-        let fixture = TestFixture::new();
-        let finalized = fixture.create_finalized(5, 5);
-        let height = Height::new(5);
-
-        let source = MockSource::new();
-        *source.block_handler.lock().unwrap() = Some(Box::new(move |query| match query {
-            Query::Index(index) if index == height.get() => {
-                Some(Payload::Finalized(Box::new(finalized.clone())))
-            }
-            _ => None,
-        }));
-
-        Runner::default().start(|context| async move {
-            let (ingress_tx, mut ingress_rx) = mpsc::channel(16);
-            let (actor, mut resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx,
-                16,
-                DEFAULT_FETCH_RETRY_TIMEOUT,
-            );
-            let _actor_handle = actor.start();
-
-            resolver.fetch(handler::Request::Finalized { height }).await;
-            let msg = ingress_rx.recv().await.unwrap();
-            match msg {
-                handler::Message::Deliver { key, .. } => {
-                    assert!(
-                        matches!(key, handler::Request::Finalized { height: h } if h == height)
-                    );
-                }
-                _ => panic!("expected Deliver message"),
-            }
-        });
-    }
-
-    /// Verifies that finalized backfill uses a height-indexed block query
-    /// (not a view-indexed finalization query) so diverged view/height still
-    /// resolves correctly.
     #[test_traced]
     fn fetches_finalized_by_height_uses_height_indexed_block_query() {
         let fixture = TestFixture::new();
         let finalized = fixture.create_finalized(5, 8);
         let height = Height::new(5);
-        let expected_height = height.get();
-
-        let block_call_count = Arc::new(Mutex::new(0u32));
-        let block_call_count_inner = block_call_count.clone();
-        let finalized_call_count = Arc::new(Mutex::new(0u32));
-        let finalized_call_count_inner = finalized_call_count.clone();
+        let block_calls = Arc::new(AtomicU32::new(0));
+        let finalized_calls = Arc::new(AtomicU32::new(0));
 
         let source = MockSource::new();
-        *source.block_handler.lock().unwrap() = Some(Box::new(move |query| {
-            *block_call_count_inner.lock().unwrap() += 1;
-            match query {
-                Query::Index(index) if index == expected_height => {
-                    Some(Payload::Finalized(Box::new(finalized.clone())))
+        {
+            let block_calls = block_calls.clone();
+            *source.block_handler.lock() = Some(Box::new(move |query| {
+                block_calls.fetch_add(1, Ordering::Relaxed);
+                match query {
+                    Query::Index(index) if index == height.get() => {
+                        Some(Payload::Finalized(Box::new(finalized.clone())))
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        }));
-        *source.finalized_handler.lock().unwrap() = Some(Box::new(move |_| {
-            *finalized_call_count_inner.lock().unwrap() += 1;
-            None
-        }));
+            }));
+        }
+        {
+            let finalized_calls = finalized_calls.clone();
+            *source.finalized_handler.lock() = Some(Box::new(move |_| {
+                finalized_calls.fetch_add(1, Ordering::Relaxed);
+                None
+            }));
+        }
 
-        Runner::default().start(|context| async move {
-            let (ingress_tx, mut ingress_rx) = mpsc::channel(16);
-            let (actor, mut resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx,
-                16,
-                DEFAULT_FETCH_RETRY_TIMEOUT,
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver =
+                start_resolver(context.child("resolver"), source, consumer.clone());
+
+            assert!(resolver.fetch(handler::Request::finalized(height)).accepted());
+            let delivery = wait_for_delivery(&context, &consumer).await;
+            assert!(
+                matches!(delivery.delivery.key, handler::Key::Finalized { height: h } if h == height)
             );
-            let _actor_handle = actor.start();
+            delivery.response.send(true).expect("response dropped");
 
-            // Allow the fetch to run to completion.
-            resolver.fetch(handler::Request::Finalized { height }).await;
-            context.sleep(Duration::from_millis(100)).await;
-
-            assert_eq!(
-                *block_call_count.lock().unwrap(),
-                1,
-                "expected finalized backfill to query block endpoint by height"
-            );
-            assert_eq!(
-                *finalized_call_count.lock().unwrap(),
-                0,
-                "expected finalized backfill to avoid view-indexed finalization endpoint"
-            );
-
-            let msg = ingress_rx.recv().await.unwrap();
-            match msg {
-                handler::Message::Deliver { key, .. } => {
-                    assert!(
-                        matches!(key, handler::Request::Finalized { height: h } if h == height)
-                    );
-                }
-                _ => panic!("expected Deliver message"),
-            }
+            assert_eq!(block_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(finalized_calls.load(Ordering::Relaxed), 0);
         });
     }
 
-    /// Verifies that the actor fetches a notarized block by round from
-    /// the source and delivers it to marshal's ingress channel.
     #[test_traced]
     fn fetches_notarized_by_round() {
         let fixture = TestFixture::new();
         let notarized = fixture.create_notarized(3, 3);
-        let round = Round::new(alto_types::EPOCH, View::new(3));
+        let round = Round::new(alto_types::EPOCH, commonware_consensus::types::View::new(3));
 
         let source = MockSource::new();
-        *source.notarized_handler.lock().unwrap() =
-            Some(Box::new(move |_| Some(notarized.clone())));
+        *source.notarized_handler.lock() = Some(Box::new(move |_| Some(notarized.clone())));
 
-        Runner::default().start(|context| async move {
-            let (ingress_tx, mut ingress_rx) = mpsc::channel(16);
-            let (actor, mut resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx,
-                16,
-                DEFAULT_FETCH_RETRY_TIMEOUT,
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
+
+            assert!(resolver
+                .fetch(handler::Request::notarized(round))
+                .accepted());
+            let delivery = wait_for_delivery(&context, &consumer).await;
+            assert!(
+                matches!(delivery.delivery.key, handler::Key::Notarized { round: r } if r == round)
             );
-            let _actor_handle = actor.start();
-
-            resolver.fetch(handler::Request::Notarized { round }).await;
-            let msg = ingress_rx.recv().await.unwrap();
-            match msg {
-                handler::Message::Deliver { key, .. } => {
-                    assert!(matches!(key, handler::Request::Notarized { round: r } if r == round));
-                }
-                _ => panic!("expected Deliver message"),
-            }
+            delivery.response.send(true).expect("response dropped");
         });
     }
 
-    /// Verifies that marshal rejecting a finalized delivery causes the
-    /// resolver to retry and redeliver it.
     #[test_traced]
     fn retries_when_marshal_rejects_finalized_delivery() {
         let fixture = TestFixture::new();
         let finalized = fixture.create_finalized(1, 1);
         let height = Height::new(1);
-        let call_count = Arc::new(Mutex::new(0u32));
-        let call_count_inner = call_count.clone();
+        let calls = Arc::new(AtomicU32::new(0));
 
         let source = MockSource::new();
-        *source.block_handler.lock().unwrap() = Some(Box::new(move |query| match query {
-            Query::Index(index) if index == height.get() => {
-                *call_count_inner.lock().unwrap() += 1;
-                Some(Payload::Finalized(Box::new(finalized.clone())))
-            }
-            _ => None,
-        }));
-
-        Runner::default().start(|context| async move {
-            let (ingress_tx, mut ingress_rx) = mpsc::channel(16);
-            let (actor, mut resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx,
-                16,
-                DEFAULT_FETCH_RETRY_TIMEOUT,
-            );
-            let _actor_handle = actor.start();
-
-            resolver.fetch(handler::Request::Finalized { height }).await;
-            let msg = ingress_rx.recv().await.unwrap();
-            match msg {
-                handler::Message::Deliver { response, .. } => {
-                    response.send(false).expect("deliver response dropped");
+        {
+            let calls = calls.clone();
+            *source.block_handler.lock() = Some(Box::new(move |query| match query {
+                Query::Index(index) if index == height.get() => {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Some(Payload::Finalized(Box::new(finalized.clone())))
                 }
-                _ => panic!("expected Deliver message"),
-            }
+                _ => None,
+            }));
+        }
 
-            let max_retry_wait = DEFAULT_FETCH_RETRY_TIMEOUT * 2 + Duration::from_millis(10);
-            context.sleep(max_retry_wait).await;
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
 
-            let retry = ingress_rx.recv().await.unwrap();
-            match retry {
-                handler::Message::Deliver { key, response, .. } => {
-                    assert!(
-                        matches!(key, handler::Request::Finalized { height: h } if h == height)
-                    );
-                    response.send(true).expect("deliver response dropped");
-                }
-                _ => panic!("expected Deliver message"),
-            }
+            assert!(resolver
+                .fetch(handler::Request::finalized(height))
+                .accepted());
+            let delivery = wait_for_delivery(&context, &consumer).await;
+            delivery.response.send(false).expect("response dropped");
 
-            assert_eq!(
-                *call_count.lock().unwrap(),
-                2,
-                "expected marshal rejection to trigger one retry"
+            context
+                .sleep(DEFAULT_FETCH_RETRY_TIMEOUT + Duration::from_millis(100))
+                .await;
+            let retry = wait_for_delivery(&context, &consumer).await;
+            assert!(
+                matches!(retry.delivery.key, handler::Key::Finalized { height: h } if h == height)
             );
+            retry.response.send(true).expect("response dropped");
+
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
         });
     }
 
-    /// Verifies that marshal rejecting a notarized delivery causes the
-    /// resolver to retry and redeliver it.
     #[test_traced]
     fn retries_when_marshal_rejects_notarized_delivery() {
         let fixture = TestFixture::new();
         let notarized = fixture.create_notarized(3, 3);
-        let round = Round::new(alto_types::EPOCH, View::new(3));
-        let call_count = Arc::new(Mutex::new(0u32));
-        let call_count_inner = call_count.clone();
+        let round = Round::new(alto_types::EPOCH, commonware_consensus::types::View::new(3));
+        let calls = Arc::new(AtomicU32::new(0));
 
         let source = MockSource::new();
-        *source.notarized_handler.lock().unwrap() = Some(Box::new(move |_| {
-            *call_count_inner.lock().unwrap() += 1;
-            Some(notarized.clone())
-        }));
+        {
+            let calls = calls.clone();
+            *source.notarized_handler.lock() = Some(Box::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some(notarized.clone())
+            }));
+        }
 
-        Runner::default().start(|context| async move {
-            let (ingress_tx, mut ingress_rx) = mpsc::channel(16);
-            let (actor, mut resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx,
-                16,
-                DEFAULT_FETCH_RETRY_TIMEOUT,
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
+
+            assert!(resolver
+                .fetch(handler::Request::notarized(round))
+                .accepted());
+            let delivery = wait_for_delivery(&context, &consumer).await;
+            delivery.response.send(false).expect("response dropped");
+
+            context
+                .sleep(DEFAULT_FETCH_RETRY_TIMEOUT + Duration::from_millis(100))
+                .await;
+            let retry = wait_for_delivery(&context, &consumer).await;
+            assert!(
+                matches!(retry.delivery.key, handler::Key::Notarized { round: r } if r == round)
             );
-            let _actor_handle = actor.start();
+            retry.response.send(true).expect("response dropped");
 
-            resolver.fetch(handler::Request::Notarized { round }).await;
-            let msg = ingress_rx.recv().await.unwrap();
-            match msg {
-                handler::Message::Deliver { response, .. } => {
-                    response.send(false).expect("deliver response dropped");
-                }
-                _ => panic!("expected Deliver message"),
-            }
-
-            let max_retry_wait = DEFAULT_FETCH_RETRY_TIMEOUT * 2 + Duration::from_millis(10);
-            context.sleep(max_retry_wait).await;
-
-            let retry = ingress_rx.recv().await.unwrap();
-            match retry {
-                handler::Message::Deliver { key, response, .. } => {
-                    assert!(matches!(key, handler::Request::Notarized { round: r } if r == round));
-                    response.send(true).expect("deliver response dropped");
-                }
-                _ => panic!("expected Deliver message"),
-            }
-
-            assert_eq!(
-                *call_count.lock().unwrap(),
-                2,
-                "expected marshal rejection to trigger one retry"
-            );
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
         });
     }
 
-    /// Verifies that duplicate fetch requests for the same key are
-    /// deduplicated -- the source handler should only be called once.
     #[test_traced]
-    fn dedup() {
+    fn deduplicates_identical_subscribers() {
         let fixture = TestFixture::new();
         let block = fixture.create_block(1, 1);
         let digest = block.digest();
-
-        let call_count = Arc::new(Mutex::new(0u32));
-        let call_count_inner = call_count.clone();
+        let calls = Arc::new(AtomicU32::new(0));
 
         let source = MockSource::new();
-        *source.block_handler.lock().unwrap() = Some(Box::new(move |_| {
-            *call_count_inner.lock().unwrap() += 1;
-            Some(Payload::Block(Box::new(block.clone())))
-        }));
+        {
+            let calls = calls.clone();
+            *source.block_handler.lock() = Some(Box::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some(Payload::Block(Box::new(block.clone())))
+            }));
+        }
 
-        Runner::default().start(|context| async move {
-            let (ingress_tx, mut ingress_rx) = mpsc::channel(16);
-            let (actor, mut resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx,
-                16,
-                DEFAULT_FETCH_RETRY_TIMEOUT,
-            );
-            let _actor_handle = actor.start();
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
+            let request = handler::Request::certified_block(digest, Height::new(1));
 
-            // Send the same request twice
-            let key = handler::Request::<Digest>::Block(digest);
-            resolver.fetch(key.clone()).await;
-            resolver.fetch(key).await;
-
-            // Wait for the single fetch to complete
-            let _msg = ingress_rx.recv().await.unwrap();
+            assert!(resolver.fetch(request).accepted());
+            assert!(resolver.fetch(request).accepted());
+            let delivery = wait_for_delivery(&context, &consumer).await;
+            assert_eq!(delivery.delivery.subscribers.len().get(), 1);
+            delivery.response.send(true).expect("response dropped");
             context.sleep(Duration::from_millis(100)).await;
 
-            // Source should have been called exactly once
-            assert_eq!(*call_count.lock().unwrap(), 1);
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(consumer.len(), 0);
         });
     }
 
-    /// Verifies that repeated fetch failures continue retrying until a later
-    /// attempt succeeds and delivers the requested payload.
     #[test_traced]
     fn failed_fetch_eventually_resolves_after_multiple_retries() {
         let fixture = TestFixture::new();
         let block = fixture.create_block(1, 1);
         let digest = block.digest();
-
-        let call_count = Arc::new(Mutex::new(0u32));
-        let call_count_inner = call_count.clone();
+        let calls = Arc::new(AtomicU32::new(0));
 
         let source = MockSource::new();
-        *source.block_handler.lock().unwrap() = Some(Box::new(move |_| {
-            let mut calls = call_count_inner.lock().unwrap();
-            *calls += 1;
-            if *calls >= 3 {
-                Some(Payload::Block(Box::new(block.clone())))
-            } else {
-                None
-            }
-        }));
+        {
+            let calls = calls.clone();
+            *source.block_handler.lock() = Some(Box::new(move |_| {
+                let attempt = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                (attempt >= 3).then(|| Payload::Block(Box::new(block.clone())))
+            }));
+        }
 
-        Runner::default().start(|context| async move {
-            let (ingress_tx, mut ingress_rx) = mpsc::channel(16);
-            let (actor, mut resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx,
-                16,
-                DEFAULT_FETCH_RETRY_TIMEOUT,
-            );
-            let _actor_handle = actor.start();
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
 
-            resolver.fetch(handler::Request::Block(digest)).await;
-            let max_retry_wait = DEFAULT_FETCH_RETRY_TIMEOUT * 2 + Duration::from_millis(10);
-            for _ in 0..3 {
-                if *call_count.lock().unwrap() >= 3 {
-                    break;
-                }
-                context.sleep(max_retry_wait).await;
-            }
+            assert!(resolver
+                .fetch(handler::Request::certified_block(digest, Height::new(1)))
+                .accepted());
+            let delivery = wait_for_delivery(&context, &consumer).await;
+            assert!(matches!(delivery.delivery.key, handler::Key::Block(d) if d == digest));
+            delivery.response.send(true).expect("response dropped");
 
-            let msg = ingress_rx.recv().await.unwrap();
-            match msg {
-                handler::Message::Deliver { key, .. } => {
-                    assert!(matches!(key, handler::Request::Block(d) if d == digest));
-                }
-                _ => panic!("expected Deliver message"),
-            }
-
-            assert_eq!(
-                *call_count.lock().unwrap(),
-                3,
-                "expected fetch to succeed on the third attempt"
-            );
+            assert_eq!(calls.load(Ordering::Relaxed), 3);
         });
     }
 
-    /// Verifies that a stale completion from an earlier fetch attempt cannot
-    /// remove or reschedule a newer fetch for the same key after the original
-    /// request was removed and re-fetched.
     #[test_traced]
-    fn stale_completion_does_not_mutate_replaced_request() {
+    fn fetch_during_validation_reuses_response_after_success() {
         let fixture = TestFixture::new();
-        let digest = fixture.create_block(1, 1).digest();
+        let block = fixture.create_block(1, 1);
+        let digest = block.digest();
+        let calls = Arc::new(AtomicU32::new(0));
 
-        Runner::default().start(|context| async move {
-            let source = MockSource::new();
-            let (ingress_tx, _ingress_rx) = mpsc::channel(16);
-            let (mut actor, _resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx,
-                16,
-                DEFAULT_FETCH_RETRY_TIMEOUT,
-            );
+        let source = MockSource::new();
+        {
+            let calls = calls.clone();
+            *source.block_handler.lock() = Some(Box::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some(Payload::Block(Box::new(block.clone())))
+            }));
+        }
 
-            let key = handler::Request::<Digest>::Block(digest);
-            actor.start_fetch(key.clone());
-            let Some(State::Active { id: first_id, .. }) = actor.requests.remove(&key) else {
-                panic!("expected first fetch attempt to be active");
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
+            let height = Height::new(1);
+
+            assert!(resolver
+                .fetch(handler::Request::certified_block(digest, height))
+                .accepted());
+            let first = wait_for_delivery(&context, &consumer).await;
+
+            assert!(resolver
+                .fetch(handler::Request::finalized_block_by_height(digest, height))
+                .accepted());
+            context.sleep(Duration::from_millis(100)).await;
+            first.response.send(true).expect("response dropped");
+
+            let second = wait_for_delivery(&context, &consumer).await;
+            assert!(matches!(second.delivery.key, handler::Key::Block(d) if d == digest));
+            assert!(second
+                .delivery
+                .subscribers
+                .contains(&handler::Annotation::Finalized(
+                    handler::Finalized::ByHeight { height }
+                )));
+            second.response.send(true).expect("response dropped");
+
+            context.sleep(Duration::from_millis(100)).await;
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        });
+    }
+
+    #[test_traced]
+    fn accepted_redelivery_rejection_does_not_refetch() {
+        let fixture = TestFixture::new();
+        let block = fixture.create_block(1, 1);
+        let digest = block.digest();
+        let calls = Arc::new(AtomicU32::new(0));
+
+        let source = MockSource::new();
+        {
+            let calls = calls.clone();
+            *source.block_handler.lock() = Some(Box::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some(Payload::Block(Box::new(block.clone())))
+            }));
+        }
+
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
+            let height = Height::new(1);
+
+            assert!(resolver
+                .fetch(handler::Request::certified_block(digest, height))
+                .accepted());
+            let first = wait_for_delivery(&context, &consumer).await;
+
+            assert!(resolver
+                .fetch(handler::Request::finalized_block_by_height(digest, height))
+                .accepted());
+            context.sleep(Duration::from_millis(100)).await;
+            first.response.send(true).expect("response dropped");
+
+            let second = wait_for_delivery(&context, &consumer).await;
+            assert!(matches!(second.delivery.key, handler::Key::Block(d) if d == digest));
+            second.response.send(false).expect("response dropped");
+
+            context
+                .sleep(DEFAULT_FETCH_RETRY_TIMEOUT + Duration::from_millis(100))
+                .await;
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(consumer.len(), 0);
+        });
+    }
+
+    #[test_traced]
+    fn retain_keeps_active_delivery_for_retained_subscriber() {
+        let fixture = TestFixture::new();
+        let block = fixture.create_block(2, 2);
+        let digest = block.digest();
+        let calls = Arc::new(AtomicU32::new(0));
+
+        let source = MockSource::new();
+        {
+            let calls = calls.clone();
+            *source.block_handler.lock() = Some(Box::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some(Payload::Block(Box::new(block.clone())))
+            }));
+        }
+
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
+            let subscriber = handler::Annotation::Certified {
+                height: Height::new(2),
             };
 
-            actor.start_fetch(key.clone());
-            let Some(State::Active { id: second_id, .. }) = actor.requests.get(&key) else {
-                panic!("expected second fetch attempt to be active");
-            };
-            let second_id = *second_id;
+            assert!(resolver
+                .fetch(handler::Request::certified_block(digest, Height::new(2)))
+                .accepted());
+            let delivery = wait_for_delivery(&context, &consumer).await;
+            assert!(delivery.delivery.subscribers.contains(&subscriber));
 
-            actor.handle_completed(Result {
-                key: key.clone(),
-                id: first_id,
-                retry: true,
-            });
+            assert!(resolver
+                .retain(move |_, candidate| *candidate == subscriber)
+                .accepted());
+            context.sleep(Duration::from_millis(100)).await;
 
-            assert!(matches!(
-                actor.requests.get(&key),
-                Some(State::Active { id, .. }) if *id == second_id
-            ));
-            assert!(
-                actor.retry_schedule.is_empty(),
-                "stale completion should not schedule a retry for the replaced request"
-            );
+            delivery.response.send(true).expect("response dropped");
+            context.sleep(Duration::from_millis(100)).await;
+
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(consumer.len(), 0);
+        });
+    }
+
+    #[test_traced]
+    fn retain_cancels_active_delivery_when_no_subscribers_remain() {
+        let fixture = TestFixture::new();
+        let block = fixture.create_block(2, 2);
+        let digest = block.digest();
+
+        let source = MockSource::new();
+        *source.block_handler.lock() = Some(Box::new(move |_| {
+            Some(Payload::Block(Box::new(block.clone())))
+        }));
+
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
+
+            assert!(resolver
+                .fetch(handler::Request::certified_block(digest, Height::new(2)))
+                .accepted());
+            let delivery = wait_for_delivery(&context, &consumer).await;
+
+            assert!(resolver.retain(|_, _| false).accepted());
+            context.sleep(Duration::from_millis(100)).await;
+
+            assert!(delivery.response.send(true).is_err());
+            assert_eq!(consumer.len(), 0);
+        });
+    }
+
+    #[test_traced]
+    fn retain_cancels_active_fetch_when_no_subscribers_remain() {
+        let fixture = TestFixture::new();
+        let digest = fixture.create_block(2, 2).digest();
+
+        deterministic::Runner::default().start(|context| async move {
+            let (source, started, dropped) = BlockingSource::new();
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
+
+            assert!(resolver
+                .fetch(handler::Request::certified_block(digest, Height::new(2)))
+                .accepted());
+            started.await.expect("source fetch did not start");
+
+            assert!(resolver.retain(|_, _| false).accepted());
+            dropped.await.expect("source fetch was not aborted");
+
+            context.sleep(Duration::from_millis(100)).await;
+            assert_eq!(consumer.len(), 0);
+        });
+    }
+
+    #[test_traced]
+    fn targeted_fetch_variants_use_same_source_path() {
+        let fixture = TestFixture::new();
+        let block = fixture.create_block(1, 1);
+        let digest = block.digest();
+        let calls = Arc::new(AtomicU32::new(0));
+
+        let source = MockSource::new();
+        {
+            let calls = calls.clone();
+            *source.block_handler.lock() = Some(Box::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some(Payload::Block(Box::new(block.clone())))
+            }));
+        }
+
+        deterministic::Runner::default().start(|context| async move {
+            let consumer = TestConsumer::default();
+            let mut resolver = start_resolver(context.child("resolver"), source, consumer.clone());
+            let target = PrivateKey::from_seed(7).public_key();
+
+            assert!(resolver
+                .fetch_targeted(
+                    handler::Request::certified_block(digest, Height::new(1)),
+                    NonEmptyVec::new(target)
+                )
+                .accepted());
+            let delivery = wait_for_delivery(&context, &consumer).await;
+            delivery.response.send(true).expect("response dropped");
+
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
         });
     }
 }

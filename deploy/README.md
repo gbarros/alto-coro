@@ -85,7 +85,7 @@ _To run a deploy, you must first install [Rust](https://www.rust-lang.org/tools/
 #### Install `commonware-deployer`
 
 ```bash
-cargo install commonware-deployer
+cargo install commonware-deployer --features aws
 ```
 
 #### Create Artifacts
@@ -167,6 +167,8 @@ _Emitted binary `validator` is placed in `assets/`._
 cd assets
 deployer aws create --config config.yaml
 ```
+
+_If your deployer machine has limited bandwidth, use `--concurrency <concurrency>` to lower the maximum number of instances configured at once (must be >= 1, default: 128)._
 
 #### Monitor Performance on Grafana
 

@@ -4,10 +4,8 @@ use crate::{
         self, Blocks, Certificates, PRUNABLE_ITEMS_PER_SECTION, REPLAY_BUFFER, WRITE_BUFFER,
     },
     resolver::Resolver,
-    NoopReceiver, NoopSender,
 };
-use alto_types::{Block, Scheme, EPOCH_LENGTH};
-use commonware_broadcast::buffered;
+use alto_types::{Block, Context, Scheme, EPOCH, EPOCH_LENGTH};
 use commonware_consensus::{
     marshal::{
         self,
@@ -19,32 +17,50 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{
     certificate::ConstantProvider,
-    ed25519::{PrivateKey, PublicKey},
-    sha256::Digest,
-    Signer,
+    ed25519::PrivateKey,
+    sha256::{self, Digest, Sha256},
+    Digest as _, Hasher, Signer,
 };
-use commonware_math::algebra::Random;
-use commonware_p2p::utils::StaticProvider;
 use commonware_parallel::Strategy;
 use commonware_runtime::{
     spawn_cell, BufferPooler, ContextCell, Handle, Metrics, Spawner, Storage,
 };
-use commonware_utils::{channel::mpsc, ordered::Set, NZUsize};
+use commonware_utils::NZUsize;
 use futures::future::try_join_all;
 use governor::clock::Clock as GClock;
 use rand::{CryptoRng, Rng};
-use std::num::NonZero;
+use std::num::{NonZero, NonZeroUsize};
 use tracing::{error, warn};
 
 const VIEW_RETENTION_TIMEOUT: ViewDelta = ViewDelta::new(2560);
-const DEQUE_SIZE: usize = 10;
 const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(1024);
+const GENESIS: &[u8] = b"commonware is neat";
+
+fn genesis() -> Block {
+    let genesis_context = Context {
+        round: commonware_consensus::types::Round::new(
+            EPOCH,
+            commonware_consensus::types::View::zero(),
+        ),
+        leader: PrivateKey::from_seed(0).public_key(),
+        parent: (
+            commonware_consensus::types::View::zero(),
+            sha256::Digest::EMPTY,
+        ),
+    };
+    Block::new(
+        genesis_context,
+        Sha256::hash(GENESIS),
+        commonware_consensus::types::Height::zero(),
+        0,
+    )
+}
 
 /// The engine that drives the follower's [MarshalActor].
 ///
 /// Unlike the validator's engine, this does not run consensus. Instead, it
 /// relies on a [Feeder](crate::feeder::Feeder) to feed certificates from a
-/// trusted source and an [Actor](crate::resolver::Actor) to backfill missing
+/// trusted source and a [Resolver] to backfill missing
 /// blocks.
 #[allow(clippy::type_complexity)]
 pub struct Engine<E, T>
@@ -60,8 +76,6 @@ where
     T: Strategy,
 {
     context: ContextCell<E>,
-    buffer: buffered::Engine<E, PublicKey, Block, StaticProvider<PublicKey>>,
-    buffer_mailbox: buffered::Mailbox<PublicKey, Block>,
     marshal: MarshalActor<
         E,
         Standard<Block>,
@@ -73,7 +87,7 @@ where
     >,
     pruning_depth: Option<u64>,
     marshal_mailbox: MarshalMailbox<Scheme, Standard<Block>>,
-    mailbox_size: usize,
+    mailbox_size: NonZeroUsize,
 }
 
 impl<E, T> Engine<E, T>
@@ -92,28 +106,15 @@ where
     pub async fn new(
         mut context: E,
         scheme: Scheme,
-        mailbox_size: usize,
+        mailbox_size: NonZeroUsize,
         max_repair: NonZero<usize>,
         strategy: T,
         pruning_depth: Option<u64>,
-    ) -> (Self, MarshalMailbox<Scheme, Standard<Block>>, Height) {
-        // Create the buffer
-        //
-        // The follower does not participate in p2p broadcast, so we use a dummy
-        // key and noop sender/receiver. The buffer is still required by marshal.
-        let dummy_key = PrivateKey::random(&mut context).public_key();
-        let (buffer, buffer_mailbox) = buffered::Engine::new(
-            context.with_label("buffer"),
-            buffered::Config {
-                public_key: dummy_key,
-                mailbox_size,
-                deque_size: DEQUE_SIZE,
-                priority: false,
-                codec_config: (),
-                peer_provider: StaticProvider::new(0, Set::from_iter_dedup([])),
-            },
-        );
-
+    ) -> (
+        Self,
+        MarshalMailbox<Scheme, Standard<Block>>,
+        Option<Height>,
+    ) {
         // Initialize the finalized certificate and block archives. Uses
         // prunable archives when pruning is enabled, immutable otherwise.
         let (finalizations_by_height, finalized_blocks, page_cache) =
@@ -123,12 +124,13 @@ where
         let provider = ConstantProvider::new(scheme);
         let epocher = FixedEpocher::new(EPOCH_LENGTH);
         let (marshal, mailbox, last_processed_height) = MarshalActor::init(
-            context.with_label("marshal"),
+            context.child("marshal"),
             finalizations_by_height,
             finalized_blocks,
             marshal::Config {
                 provider,
                 epocher,
+                start: marshal::Start::Genesis(genesis()),
                 partition_prefix: "follower-marshal".to_string(),
                 mailbox_size,
                 view_retention_timeout: VIEW_RETENTION_TIMEOUT,
@@ -148,8 +150,6 @@ where
         // Return the engine and marshal mailbox
         let engine = Self {
             context: ContextCell::new(context),
-            buffer,
-            buffer_mailbox,
             marshal,
             pruning_depth,
             marshal_mailbox: mailbox.clone(),
@@ -159,17 +159,11 @@ where
     }
 
     /// Start the [Engine].
-    pub fn start(
-        mut self,
-        marshal: (mpsc::Receiver<handler::Message<Digest>>, Resolver),
-    ) -> Handle<()> {
-        spawn_cell!(self.context, self.run(marshal).await)
+    pub fn start(mut self, marshal: (handler::Receiver<Digest>, Resolver)) -> Handle<()> {
+        spawn_cell!(self.context, self.run(marshal))
     }
 
-    async fn run(mut self, marshal: (mpsc::Receiver<handler::Message<Digest>>, Resolver)) {
-        // Start the buffer
-        let buffer_handle = self.buffer.start((NoopSender, NoopReceiver));
-
+    async fn run(mut self, marshal: (handler::Receiver<Digest>, Resolver)) {
         // Start the application actor
         let (app, mailbox) = Application::new(
             self.context.take(),
@@ -180,10 +174,10 @@ where
         let app_handle = app.start();
 
         // Start marshal
-        let marshal_handle = self.marshal.start(mailbox, self.buffer_mailbox, marshal);
+        let marshal_handle = self.marshal.start_unbuffered(mailbox, marshal);
 
         // Wait for any actor to finish
-        if let Err(e) = try_join_all(vec![buffer_handle, marshal_handle, app_handle]).await {
+        if let Err(e) = try_join_all(vec![marshal_handle, app_handle]).await {
             error!(?e, "engine failed");
         } else {
             warn!("engine stopped");
@@ -194,25 +188,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolver::Actor;
-    use crate::test_utils::TestFixture;
+    use crate::test_utils::{MockSource, TestFixture};
     use bytes::Bytes;
     use commonware_codec::Encode;
-    use commonware_consensus::{
-        marshal::resolver::handler,
-        types::{Height, Round, View},
-    };
+    use commonware_consensus::types::{Round, View};
     use commonware_macros::test_traced;
     use commonware_parallel::Sequential;
-    use commonware_runtime::{deterministic::Runner, Metrics, Runner as _};
-    use commonware_utils::channel::{mpsc, oneshot};
-    use commonware_utils::NZUsize;
+    use commonware_resolver::{Consumer, Delivery};
+    use commonware_runtime::{deterministic::Runner, Runner as _, Supervisor as _};
+    use commonware_utils::{vec::NonEmptyVec, NZUsize};
     use std::time::Duration;
+
+    async fn start_engine_with_handler(
+        context: commonware_runtime::deterministic::Context,
+        scheme: Scheme,
+    ) -> handler::Handler<Digest> {
+        let (engine, _, _) = Engine::new(
+            context.child("engine"),
+            scheme,
+            NZUsize!(16),
+            NZUsize!(256),
+            Sequential,
+            None,
+        )
+        .await;
+        let (receiver, handler) = handler::init(context.child("handler"), NZUsize!(16));
+        let (_, resolver) = crate::resolver::init(
+            context.child("resolver"),
+            MockSource::new(),
+            NZUsize!(16),
+            Duration::from_secs(1),
+        );
+        engine.start((receiver, resolver));
+        handler
+    }
 
     /// Verifies that marshal's Deliver handler rejects a finalization whose
     /// threshold signature does not match the configured scheme. This is
-    /// the resolver path's signature verification (as opposed to the feeder
-    /// path tested in feeder::tests).
+    /// the resolver path's signature verification, as opposed to the feeder
+    /// path tested in feeder::tests.
     #[test_traced]
     fn marshal_rejects_invalid_finalization_from_resolver() {
         let fixture = TestFixture::new();
@@ -220,46 +234,21 @@ mod tests {
         let wrong_verifier = fixture.wrong_verifier_scheme();
 
         Runner::default().start(|context| async move {
-            let (engine, _mailbox, _) = Engine::new(
-                context.with_label("engine"),
-                wrong_verifier.clone(),
-                16,
-                NZUsize!(256),
-                Sequential,
-                None,
-            )
-            .await;
+            let mut handler = start_engine_with_handler(context, wrong_verifier).await;
 
-            // Wire up the resolver and start the engine
-            let (ingress_tx, ingress_rx) = mpsc::channel(16);
-            let source = crate::test_utils::MockSource::new();
-            let (_, resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx.clone(),
-                16,
-                Duration::from_secs(1),
-            );
-            let _engine_handle = engine.start((ingress_rx, resolver));
-
-            // Manually inject a finalization into marshal's ingress channel,
-            // bypassing the resolver actor to control the payload directly.
-            let key = handler::Request::<Digest>::Finalized {
-                height: Height::new(1),
-            };
+            let height = Height::new(1);
             let value = Bytes::from((finalized.proof, finalized.block).encode().to_vec());
-            let (response_tx, response_rx) = oneshot::channel();
-            ingress_tx
-                .send(handler::Message::Deliver {
-                    key,
-                    value,
-                    response: response_tx,
-                })
-                .await
-                .expect("send failed");
+            let response = handler.deliver(
+                Delivery {
+                    key: handler::Key::Finalized { height },
+                    subscribers: NonEmptyVec::new(handler::Annotation::Finalized(
+                        handler::Finalized::ByHeight { height },
+                    )),
+                },
+                value,
+            );
 
-            // Marshal should reject the delivery due to signature mismatch
-            let accepted = response_rx.await.expect("response dropped");
+            let accepted = response.await.expect("response dropped");
             assert!(
                 !accepted,
                 "marshal should reject finalization with invalid signature"
@@ -276,42 +265,19 @@ mod tests {
         let wrong_verifier = fixture.wrong_verifier_scheme();
 
         Runner::default().start(|context| async move {
-            let (engine, _mailbox, _) = Engine::new(
-                context.with_label("engine"),
-                wrong_verifier.clone(),
-                16,
-                NZUsize!(256),
-                Sequential,
-                None,
-            )
-            .await;
+            let mut handler = start_engine_with_handler(context, wrong_verifier).await;
 
-            let (ingress_tx, ingress_rx) = mpsc::channel(16);
-            let source = crate::test_utils::MockSource::new();
-            let (_, resolver) = Actor::new(
-                context.with_label("resolver"),
-                source,
-                ingress_tx.clone(),
-                16,
-                Duration::from_secs(1),
-            );
-            let _engine_handle = engine.start((ingress_rx, resolver));
-
-            // Inject a notarization directly into marshal's ingress channel
-            let round = Round::new(alto_types::EPOCH, View::new(1));
-            let key = handler::Request::<Digest>::Notarized { round };
+            let round = Round::new(EPOCH, View::new(1));
             let value = Bytes::from((notarized.proof, notarized.block).encode().to_vec());
-            let (response_tx, response_rx) = oneshot::channel();
-            ingress_tx
-                .send(handler::Message::Deliver {
-                    key,
-                    value,
-                    response: response_tx,
-                })
-                .await
-                .expect("send failed");
+            let response = handler.deliver(
+                Delivery {
+                    key: handler::Key::Notarized { round },
+                    subscribers: NonEmptyVec::new(handler::Annotation::Notarization { round }),
+                },
+                value,
+            );
 
-            let accepted = response_rx.await.expect("response dropped");
+            let accepted = response.await.expect("response dropped");
             assert!(
                 !accepted,
                 "marshal should reject notarization with invalid signature"
