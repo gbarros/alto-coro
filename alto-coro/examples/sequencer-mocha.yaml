@@ -6,6 +6,8 @@ confirmation_mode: soft
 block_time_ms: 500
 publish_queue: 1024
 publish_concurrency: 8
+publish_batch_max_blocks: 4
+publish_batch_max_delay_ms: 1500
 serve_payloads: true
 
 celestia:

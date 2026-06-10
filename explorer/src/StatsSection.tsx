@@ -270,10 +270,10 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
             ? "The median difference between consecutive Alto block timestamps produced by the local Coro sequencer. This follows alto-coro block_time_ms, not Celestia block time."
             : "The median difference between consecutive block timestamps.<br><br><i>This is functionally equivalent to the average validator's time to lock (unlike your browser, validators are connected directly to each other instead of an intermediary streaming layer).</i>",
         timeToLock: isCoro
-            ? "The median latency from block timestamp to observing the block in the sequencer's soft-confirmed archive."
+            ? "The median backend latency from local soft confirmation to PFB broadcast acceptance. This captures the rolling batch window plus submit RPC, not Celestia inclusion."
             : "The median latency from block proposal to receiving 2f+1 votes, as observed by your browser.<br><br><i>Locked blocks must be included in the canonical chain if the view is not nullified.</i>",
         timeToFinalize: isCoro
-            ? "The median latency from Alto block timestamp to the browser observing that Coro has a Celestia blob reference. This includes publish queue time, Celestia submission/readback, RPC/provider latency, and explorer polling."
+            ? "The median latency from Alto block timestamp to the Mocha block timestamp that committed the PFB transaction. If the Mocha header timestamp is temporarily unavailable, the backend falls back to its own committed-at observation."
             : "The median latency from block proposal to receiving 2f+1 finalizes, as observed by your browser.<br><br><i>Once finalized, a block is immutable.</i>"
     };
 
@@ -306,11 +306,11 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
                 </div>
 
                 <div className="stat-box browser-metrics">
-                    <div className="source-label">BROWSER</div>
+                    <div className="source-label">{isCoro ? "BACKEND" : "BROWSER"}</div>
                     <div className="browser-metrics-container">
                         <div className="metric-container">
                             <Tooltip content={tooltips.timeToLock}>
-                                <div className="stat-label">{isCoro ? "Soft" : "Locked"}</div>
+                                <div className="stat-label">{isCoro ? "Submit Delay" : "Locked"}</div>
                                 <div className="stat-value">
                                     {medianTimeToLock > 0 ? `${medianTimeToLock}ms` : "N/A"}
                                 </div>
@@ -331,7 +331,7 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
 
             <div className="stats-disclaimer">
                 {isCoro
-                    ? "Coro mode displays soft confirmations from the sequencer and canonical publication once Celestia blob refs are available."
+                    ? "Coro mode displays backend-reported submission timing and Celestia publication timing from Mocha block timestamps when available."
                     : "All latency measurements made by your browser are only performed after verifying the integrity of incoming artifacts with the network key. Local clock skew is automatically detected and corrected."}
             </div>
         </div >

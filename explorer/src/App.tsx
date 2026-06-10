@@ -45,6 +45,36 @@ const CORO_SOFT_WINDOW = 35;
 const CORO_PUBLISHED_WINDOW = 15;
 const CORO_FETCH_CONCURRENCY = 8;
 
+type CoroSoftTiming = {
+  block_timestamp_ms: number;
+  soft_confirmed_at_ms: number;
+  soft_latency_ms: number;
+};
+
+type CoroCommitTiming = {
+  tx_hash: string;
+  pfb_broadcasted_at_ms: number;
+  celestia_committed_at_ms: number;
+  celestia_block_time_ms?: number;
+  publish_latency_ms?: number;
+  backend_commit_latency_ms: number;
+  batch_wait_ms: number;
+  soft_to_pfb_broadcast_ms: number;
+  broadcast_latency_ms: number;
+  confirmation_wait_ms: number;
+};
+
+type CoroStatusResponse =
+  | { status: "archived"; soft?: CoroSoftTiming }
+  | { status: "published"; cursor: unknown; soft?: CoroSoftTiming; commit?: CoroCommitTiming };
+
+type CoroBlockRecord = {
+  block: BlockJs;
+  status: "archived" | "published";
+  softLatencyMs?: number;
+  publishLatencyMs?: number;
+};
+
 const center = new LatLng(0, 0);
 const markerIcon = new DivIcon({
   className: "custom-div-icon",
@@ -121,7 +151,7 @@ const App: React.FC = () => {
   const coroPollInFlightRef = useRef(false);
   const coroWasmInitRef = useRef<Promise<void> | null>(null);
   const coroBlockCacheRef = useRef<Map<number, BlockJs>>(new Map());
-  const coroStatusCacheRef = useRef<Map<number, "archived" | "published">>(new Map());
+  const coroStatusCacheRef = useRef<Map<number, CoroStatusResponse>>(new Map());
   const coroLastArchivedHeadRef = useRef<number | null>(null);
 
   const performClusterSwitch = useCallback((cluster: Cluster) => {
@@ -600,7 +630,7 @@ const App: React.FC = () => {
     handleFinalizedRef.current = handleFinalization;
   }, [handleFinalization]);
 
-  const upsertCoroBlocks = useCallback((records: Array<{ block: BlockJs; status: "archived" | "published" }>) => {
+  const upsertCoroBlocks = useCallback((records: CoroBlockRecord[]) => {
     if (records.length === 0) return;
 
     const currentTime = adjustTime(Date.now());
@@ -609,16 +639,24 @@ const App: React.FC = () => {
     setViews((prevViews) => {
       let newViews = [...prevViews];
 
-      for (const { block, status } of records) {
+      for (const { block, status, softLatencyMs, publishLatencyMs } of records) {
         const view = block.height;
         const blockTime = Number(block.timestamp) || currentTime;
         const index = newViews.findIndex((v) => v.view === view);
         const existing = index >= 0 ? newViews[index] : undefined;
         const alreadyFinalized = existing?.status === "finalized";
         const nextStatus = status === "published" || alreadyFinalized ? "finalized" : "notarized";
-        const notarizationTime = existing?.notarizationTime ?? currentTime;
+        const notarizationLatency = softLatencyMs ?? existing?.actualNotarizationLatency;
+        const notarizationTime =
+          notarizationLatency !== undefined
+            ? existing?.notarizationTime ?? blockTime + notarizationLatency
+            : existing?.notarizationTime;
+        const finalizationLatency =
+          publishLatencyMs ?? existing?.actualFinalizationLatency;
         const finalizationTime =
-          nextStatus === "finalized" ? existing?.finalizationTime ?? currentTime : existing?.finalizationTime;
+          nextStatus === "finalized"
+            ? existing?.finalizationTime ?? (finalizationLatency !== undefined ? blockTime + finalizationLatency : currentTime)
+            : existing?.finalizationTime;
 
         const nextView: ViewData = {
           ...existing,
@@ -629,11 +667,12 @@ const App: React.FC = () => {
           finalizationTime,
           block,
           timeoutId: undefined,
-          actualNotarizationLatency:
-            existing?.actualNotarizationLatency ?? Math.max(0, notarizationTime - blockTime),
+          actualNotarizationLatency: notarizationLatency,
           actualFinalizationLatency:
-            finalizationTime !== undefined
-              ? existing?.actualFinalizationLatency ?? Math.max(0, finalizationTime - blockTime)
+            finalizationLatency !== undefined
+              ? finalizationLatency
+              : finalizationTime !== undefined
+                ? existing?.actualFinalizationLatency ?? Math.max(0, finalizationTime - blockTime)
               : existing?.actualFinalizationLatency,
         };
 
@@ -735,15 +774,14 @@ const App: React.FC = () => {
           addRange(published.head, CORO_PUBLISHED_WINDOW);
         }
 
-        const fetchSequence = async (sequence: number): Promise<{ block: BlockJs; status: "archived" | "published" } | null> => {
+        const fetchSequence = async (sequence: number): Promise<CoroBlockRecord | null> => {
           if (cancelled) return null;
 
-          let status = coroStatusCacheRef.current.get(sequence);
-          if (status !== "published") {
-            const statusResponse = await fetchJson<{ status: "archived" } | { status: "published"; cursor: unknown }>(`/status/${sequence}`);
+          let statusResponse: CoroStatusResponse | null | undefined = coroStatusCacheRef.current.get(sequence);
+          if (statusResponse?.status !== "published") {
+            statusResponse = await fetchJson<CoroStatusResponse>(`/status/${sequence}`);
             if (!statusResponse) return null;
-            status = statusResponse.status === "published" ? "published" : "archived";
-            coroStatusCacheRef.current.set(sequence, status);
+            coroStatusCacheRef.current.set(sequence, statusResponse);
           }
 
           let block = coroBlockCacheRef.current.get(sequence);
@@ -758,10 +796,21 @@ const App: React.FC = () => {
           }
           if (!block) return null;
 
-          return { block, status };
+          return {
+            block,
+            status: statusResponse.status === "published" ? "published" : "archived",
+            softLatencyMs:
+              statusResponse.status === "published"
+                ? statusResponse.commit?.soft_to_pfb_broadcast_ms
+                : undefined,
+            publishLatencyMs:
+              statusResponse.status === "published"
+                ? statusResponse.commit?.publish_latency_ms ?? statusResponse.commit?.backend_commit_latency_ms
+                : undefined,
+          };
         };
 
-        const records: Array<{ block: BlockJs; status: "archived" | "published" }> = [];
+        const records: CoroBlockRecord[] = [];
         const orderedSequences = Array.from(sequences).sort((a, b) => b - a);
         for (let index = 0; index < orderedSequences.length; index += CORO_FETCH_CONCURRENCY) {
           if (cancelled) return;

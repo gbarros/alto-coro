@@ -8,8 +8,8 @@ use axum::{
     Router,
 };
 use bytes::{Buf, BufMut, Bytes};
-use celestia_client::tx::SigningKey;
-use celestia_client::types::state::AccAddress;
+use celestia_client::tx::{SigningKey, TxConfig};
+use celestia_client::types::{nmt::Namespace, state::AccAddress, Blob as CelestiaBlob};
 use celestia_client::Client;
 use celestia_grpc::GrpcClient;
 use clap::{Parser, Subcommand};
@@ -28,8 +28,8 @@ use coro::{
         Application, AppliedBatch, ExecutedBatch, Replica, ReplicaApplication, ReplicaConfig,
         SingleSequencer,
     },
-    BatchCursor, BatchNumber, BatchPolicy, ChainConfig, PublishRequest, Publisher, PublisherConfig,
-    ReaderConfig, RetryConfig, SubmissionId, VerificationMode,
+    BatchCursor, BatchNumber, BatchPolicy, BlobCommitment, BlobRef, ChainConfig, PublisherConfig,
+    ReaderConfig, RetryConfig, VerificationMode,
 };
 use coro_demo::{HistoryServerConfig, HttpReplicaSource};
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,10 @@ struct SequencerFile {
     publish_queue: usize,
     #[serde(default = "default_publish_concurrency")]
     publish_concurrency: usize,
+    #[serde(default = "default_publish_batch_max_blocks")]
+    publish_batch_max_blocks: usize,
+    #[serde(default = "default_publish_batch_max_delay_ms")]
+    publish_batch_max_delay_ms: u64,
     #[serde(default = "default_serve_payloads")]
     serve_payloads: bool,
 }
@@ -361,7 +365,53 @@ struct SoftBatch {
     payload: Bytes,
     payload_hash: [u8; 32],
     metadata: BlockMeta,
+    soft_confirmed_at: u64,
     cursor: Option<BatchCursor>,
+    commit: Option<SoftCommit>,
+}
+
+#[derive(Clone)]
+struct SoftCommit {
+    tx_hash: String,
+    pfb_broadcasted_at_ms: u64,
+    celestia_committed_at_ms: u64,
+    celestia_block_time_ms: Option<u64>,
+    publish_latency_ms: Option<u64>,
+    backend_commit_latency_ms: u64,
+    batch_wait_ms: u64,
+    soft_to_pfb_broadcast_ms: u64,
+    broadcast_latency_ms: u64,
+    confirmation_wait_ms: u64,
+}
+
+#[derive(Clone)]
+struct SoftCelestiaCommitter {
+    grpc: GrpcClient,
+    header_client: Arc<Client>,
+    header_time_cache: Arc<tokio::sync::Mutex<HashMap<u64, u64>>>,
+    namespace: coro::NamespaceId,
+    celestia_namespace: Namespace,
+    tx_config: TxConfig,
+}
+
+impl SoftCelestiaCommitter {
+    fn new(
+        grpc: GrpcClient,
+        header_client: Arc<Client>,
+        namespace: coro::NamespaceId,
+        tx_config: TxConfig,
+    ) -> Self {
+        let celestia_namespace =
+            celestia_namespace(namespace).expect("invalid Celestia namespace for soft publisher");
+        Self {
+            grpc,
+            header_client,
+            header_time_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            namespace,
+            celestia_namespace,
+            tx_config,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -383,10 +433,11 @@ impl SoftSequencerHistory {
         state.batches.insert(batch.sequence, batch);
     }
 
-    async fn publish(&self, sequence: BatchNumber, cursor: BatchCursor) {
+    async fn publish(&self, sequence: BatchNumber, cursor: BatchCursor, commit: SoftCommit) {
         let mut state = self.state.lock().await;
         if let Some(batch) = state.batches.get_mut(&sequence) {
             batch.cursor = Some(cursor);
+            batch.commit = Some(commit);
         }
 
         let mut next = match state.published_head {
@@ -548,17 +599,19 @@ fn run_sequencer(path: PathBuf) -> Result<(), Box<dyn Error>> {
 
     runtime.start(|context| async move {
         let signer = signer(&config.private_key, config.signer_seed);
-        let backend = backend(&config.celestia).await;
+        let celestia = celestia_clients(&config.celestia).await;
         let chain_config = chain_config(&config.celestia, &config.batch);
 
         match config.confirmation_mode {
             ConfirmationMode::Soft => {
                 let history = Arc::new(SoftSequencerHistory::default());
                 let history_trait = history.clone() as Arc<dyn coro_demo::SequencerHistory>;
+                let soft_history = Some(history.clone());
                 let history_listen = config.history_listen;
                 let history_handle = tokio::spawn(async move {
                     serve_history(
                         history_trait,
+                        soft_history,
                         HistoryServerConfig {
                             serve_payloads: config.serve_payloads,
                         },
@@ -569,17 +622,20 @@ fn run_sequencer(path: PathBuf) -> Result<(), Box<dyn Error>> {
                 });
                 info!(listen = %history_listen, mode = "soft", "coro history HTTP listening");
 
-                let publisher = Publisher::new(
-                    context.child("publisher"),
-                    backend,
-                    publisher_config(&config.partition_prefix, &chain_config, &config.batch),
+                let committer = SoftCelestiaCommitter::new(
+                    celestia.grpc.clone(),
+                    celestia.header.clone(),
+                    chain_config.namespace,
+                    TxConfig::default(),
                 );
                 let (publish_tx, publish_rx) = mpsc::channel(config.publish_queue.max(1));
                 let publish_handle = tokio::spawn(run_soft_publish_loop(
-                    Arc::new(publisher),
+                    committer,
                     history.clone(),
                     publish_rx,
                     config.publish_concurrency.max(1),
+                    config.publish_batch_max_blocks.max(1),
+                    Duration::from_millis(config.publish_batch_max_delay_ms),
                 ));
                 let loop_handle = tokio::spawn(run_soft_sequencer_loop(
                     BlockBuilder::new(signer.public_key()),
@@ -599,7 +655,7 @@ fn run_sequencer(path: PathBuf) -> Result<(), Box<dyn Error>> {
                 let chain = builder.chain();
                 let sequencer = Arc::new(SingleSequencer::new(
                     context.child("sequencer"),
-                    backend,
+                    celestia.backend,
                     publisher_config(&config.partition_prefix, &chain_config, &config.batch),
                     reader_config(&chain_config, &config.batch),
                     sequencer_config(&config.partition_prefix, &config.batch),
@@ -622,6 +678,7 @@ fn run_sequencer(path: PathBuf) -> Result<(), Box<dyn Error>> {
                 let history_handle = tokio::spawn(async move {
                     serve_history(
                         history,
+                        None,
                         HistoryServerConfig {
                             serve_payloads: config.serve_payloads,
                         },
@@ -658,7 +715,7 @@ fn run_replica(path: PathBuf) -> Result<(), Box<dyn Error>> {
     );
 
     runtime.start(|context| async move {
-        let backend = backend(&config.celestia).await;
+        let backend = read_only_backend(&config.celestia).await;
         let chain_config = chain_config(&config.celestia, &config.batch);
         let replica = Arc::new(Replica::new(
             context.child("replica"),
@@ -711,15 +768,18 @@ async fn run_sequencer_loop(
 #[derive(Clone)]
 struct HistoryApiState {
     history: Arc<dyn coro_demo::SequencerHistory>,
+    soft_history: Option<Arc<SoftSequencerHistory>>,
     serve_payloads: bool,
 }
 
 fn history_router(
     history: Arc<dyn coro_demo::SequencerHistory>,
+    soft_history: Option<Arc<SoftSequencerHistory>>,
     config: HistoryServerConfig,
 ) -> Router {
     let state = HistoryApiState {
         history: history.clone(),
+        soft_history,
         serve_payloads: config.serve_payloads,
     };
     Router::new()
@@ -737,11 +797,12 @@ fn history_router(
 
 async fn serve_history(
     history: Arc<dyn coro_demo::SequencerHistory>,
+    soft_history: Option<Arc<SoftSequencerHistory>>,
     config: HistoryServerConfig,
     bind: SocketAddr,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, history_router(history, config)).await
+    axum::serve(listener, history_router(history, soft_history, config)).await
 }
 
 async fn health() -> impl IntoResponse {
@@ -756,8 +817,17 @@ struct HeadResponse {
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum StatusResponse {
-    Archived,
-    Published { cursor: CursorResponse },
+    Archived {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        soft: Option<SoftConfirmResponse>,
+    },
+    Published {
+        cursor: CursorResponse,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        soft: Option<SoftConfirmResponse>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        commit: Option<CommitResponse>,
+    },
 }
 
 #[derive(Serialize)]
@@ -774,6 +844,29 @@ struct BlobRefResponse {
     commitment: String,
 }
 
+#[derive(Serialize)]
+struct SoftConfirmResponse {
+    block_timestamp_ms: u64,
+    soft_confirmed_at_ms: u64,
+    soft_latency_ms: u64,
+}
+
+#[derive(Serialize)]
+struct CommitResponse {
+    tx_hash: String,
+    pfb_broadcasted_at_ms: u64,
+    celestia_committed_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    celestia_block_time_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publish_latency_ms: Option<u64>,
+    backend_commit_latency_ms: u64,
+    batch_wait_ms: u64,
+    soft_to_pfb_broadcast_ms: u64,
+    broadcast_latency_ms: u64,
+    confirmation_wait_ms: u64,
+}
+
 impl From<BatchCursor> for CursorResponse {
     fn from(cursor: BatchCursor) -> Self {
         Self {
@@ -788,14 +881,61 @@ impl From<BatchCursor> for CursorResponse {
     }
 }
 
+impl From<&SoftBatch> for SoftConfirmResponse {
+    fn from(batch: &SoftBatch) -> Self {
+        Self {
+            block_timestamp_ms: batch.metadata.timestamp,
+            soft_confirmed_at_ms: batch.soft_confirmed_at,
+            soft_latency_ms: batch
+                .soft_confirmed_at
+                .saturating_sub(batch.metadata.timestamp),
+        }
+    }
+}
+
+impl From<SoftCommit> for CommitResponse {
+    fn from(commit: SoftCommit) -> Self {
+        Self {
+            tx_hash: commit.tx_hash,
+            pfb_broadcasted_at_ms: commit.pfb_broadcasted_at_ms,
+            celestia_committed_at_ms: commit.celestia_committed_at_ms,
+            celestia_block_time_ms: commit.celestia_block_time_ms,
+            publish_latency_ms: commit.publish_latency_ms,
+            backend_commit_latency_ms: commit.backend_commit_latency_ms,
+            batch_wait_ms: commit.batch_wait_ms,
+            soft_to_pfb_broadcast_ms: commit.soft_to_pfb_broadcast_ms,
+            broadcast_latency_ms: commit.broadcast_latency_ms,
+            confirmation_wait_ms: commit.confirmation_wait_ms,
+        }
+    }
+}
+
 impl From<coro::BatchStatus> for StatusResponse {
     fn from(status: coro::BatchStatus) -> Self {
         match status {
-            coro::BatchStatus::Archived => Self::Archived,
+            coro::BatchStatus::Archived => Self::Archived { soft: None },
             coro::BatchStatus::Published(cursor) => Self::Published {
                 cursor: cursor.into(),
+                soft: None,
+                commit: None,
             },
         }
+    }
+}
+
+impl SoftSequencerHistory {
+    async fn status_response(&self, sequence: BatchNumber) -> Option<StatusResponse> {
+        self.state.lock().await.batches.get(&sequence).map(|batch| {
+            let soft = Some(SoftConfirmResponse::from(batch));
+            match batch.cursor.clone() {
+                Some(cursor) => StatusResponse::Published {
+                    cursor: cursor.into(),
+                    soft,
+                    commit: batch.commit.clone().map(Into::into),
+                },
+                None => StatusResponse::Archived { soft },
+            }
+        })
     }
 }
 
@@ -829,6 +969,13 @@ async fn history_status(
     AxumPath(sequence): AxumPath<u64>,
     AxumState(state): AxumState<HistoryApiState>,
 ) -> impl IntoResponse {
+    if let Some(history) = &state.soft_history {
+        match history.status_response(BatchNumber(sequence)).await {
+            Some(status) => return axum::Json(status).into_response(),
+            None => return StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
     match state.history.status(BatchNumber(sequence)).await {
         Ok(Some(status)) => axum::Json(StatusResponse::from(status)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -953,7 +1100,9 @@ async fn run_soft_sequencer_loop(
                     payload: executed.payload,
                     payload_hash,
                     metadata: executed.metadata,
+                    soft_confirmed_at: now_millis(),
                     cursor: None,
+                    commit: None,
                 };
                 history.archive(batch.clone()).await;
                 info!(
@@ -976,78 +1125,282 @@ async fn run_soft_sequencer_loop(
 }
 
 async fn run_soft_publish_loop(
-    publisher: Arc<Publisher<runtime_tokio::Context, CelestiaClientBackend>>,
+    committer: SoftCelestiaCommitter,
     history: Arc<SoftSequencerHistory>,
     mut publish_rx: mpsc::Receiver<SoftBatch>,
     publish_concurrency: usize,
+    publish_batch_max_blocks: usize,
+    publish_batch_max_delay: Duration,
 ) {
     let mut in_flight = JoinSet::new();
-    info!(publish_concurrency, "soft publisher pipeline started");
-    while let Some(batch) = publish_rx.recv().await {
+    info!(
+        publish_concurrency,
+        publish_batch_max_blocks,
+        publish_batch_max_delay_ms = publish_batch_max_delay.as_millis(),
+        "soft Celestia commit pipeline started"
+    );
+    while let Some(first) = publish_rx.recv().await {
         while in_flight.len() >= publish_concurrency {
             if let Some(result) = in_flight.join_next().await {
                 if let Err(error) = result {
-                    warn!(error = %error, "soft publish task failed");
+                    warn!(error = %error, "soft Celestia commit task failed");
                 }
             }
         }
 
-        let publisher = publisher.clone();
+        let batches = collect_soft_publish_batch(
+            first,
+            &mut publish_rx,
+            publish_batch_max_blocks,
+            publish_batch_max_delay,
+        )
+        .await;
+        let committer = committer.clone();
         let history = history.clone();
         in_flight.spawn(async move {
-            publish_soft_batch(publisher, history, batch).await;
+            publish_soft_batches(committer, history, batches).await;
         });
     }
 
     while let Some(result) = in_flight.join_next().await {
         if let Err(error) = result {
-            warn!(error = %error, "soft publish task failed");
+            warn!(error = %error, "soft Celestia commit task failed");
         }
     }
 }
 
-async fn publish_soft_batch(
-    publisher: Arc<Publisher<runtime_tokio::Context, CelestiaClientBackend>>,
-    history: Arc<SoftSequencerHistory>,
-    batch: SoftBatch,
+async fn collect_soft_publish_batch(
+    first: SoftBatch,
+    publish_rx: &mut mpsc::Receiver<SoftBatch>,
+    max_blocks: usize,
+    max_delay: Duration,
+) -> Vec<SoftBatch> {
+    let max_blocks = max_blocks.max(1);
+    let mut batches = Vec::with_capacity(max_blocks);
+    batches.push(first);
+    drain_ready_soft_batches(publish_rx, &mut batches, max_blocks);
+    if batches.len() >= max_blocks || max_delay.is_zero() {
+        return batches;
+    }
+
+    let delay = time::sleep(max_delay);
+    tokio::pin!(delay);
+    loop {
+        tokio::select! {
+            _ = &mut delay => break,
+            maybe_batch = publish_rx.recv(), if batches.len() < max_blocks => {
+                match maybe_batch {
+                    Some(batch) => {
+                        batches.push(batch);
+                        drain_ready_soft_batches(publish_rx, &mut batches, max_blocks);
+                        if batches.len() >= max_blocks {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    batches
+}
+
+fn drain_ready_soft_batches(
+    publish_rx: &mut mpsc::Receiver<SoftBatch>,
+    batches: &mut Vec<SoftBatch>,
+    max_blocks: usize,
 ) {
-    let queued_for = now_millis().saturating_sub(batch.metadata.timestamp);
+    while batches.len() < max_blocks {
+        match publish_rx.try_recv() {
+            Ok(batch) => batches.push(batch),
+            Err(_) => break,
+        }
+    }
+}
+
+async fn publish_soft_batches(
+    committer: SoftCelestiaCommitter,
+    history: Arc<SoftSequencerHistory>,
+    batches: Vec<SoftBatch>,
+) {
+    if batches.is_empty() {
+        return;
+    }
+
+    let first_sequence = batches
+        .first()
+        .expect("soft publish batch cannot be empty")
+        .sequence;
+    let last_sequence = batches
+        .last()
+        .expect("soft publish batch cannot be empty")
+        .sequence;
+
+    let (blobs, commitments) = match celestia_blobs_for_soft_batches(&committer, &batches) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            warn!(
+                first_sequence = first_sequence.0,
+                last_sequence = last_sequence.0,
+                batch_size = batches.len(),
+                error = %error,
+                "failed to build Celestia blobs for soft-confirmed blocks"
+            );
+            return;
+        }
+    };
+
     loop {
         let started_at = now_millis();
-        match publisher
-            .publish(PublishRequest {
-                id: submission_id(batch.sequence, batch.payload_hash),
-                payload: batch.payload.clone(),
-            })
+        let submitted = match committer
+            .grpc
+            .broadcast_blobs(&blobs, committer.tx_config.clone())
             .await
         {
-            Ok(receipt) => {
-                let cursor = BatchCursor {
-                    sequence: batch.sequence,
-                    blob_ref: receipt.blob_ref,
-                    payload_hash: batch.payload_hash,
+            Ok(submitted) => submitted,
+            Err(error) => {
+                warn!(
+                    first_sequence = first_sequence.0,
+                    last_sequence = last_sequence.0,
+                    batch_size = batches.len(),
+                    error = %error,
+                    "soft-confirmed block batch broadcast failed; retrying"
+                );
+                time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let broadcasted_at = now_millis();
+        let tx_hash = hex(submitted.tx_ref().hash.as_bytes());
+
+        match submitted.confirm().await {
+            Ok(tx_info) => {
+                let committed_at = now_millis();
+                let celestia_block_time_ms = match time::timeout(
+                    Duration::from_secs(2),
+                    celestia_block_time_ms(&committer, tx_info.height),
+                )
+                .await
+                {
+                    Ok(timestamp) => timestamp,
+                    Err(_) => {
+                        warn!(
+                            celestia_height = tx_info.height,
+                            "timed out fetching Celestia header timestamp"
+                        );
+                        None
+                    }
                 };
-                history.publish(batch.sequence, cursor.clone()).await;
+
+                for (batch, commitment) in batches.iter().zip(commitments.iter()) {
+                    let cursor = BatchCursor {
+                        sequence: batch.sequence,
+                        blob_ref: BlobRef {
+                            height: tx_info.height,
+                            namespace: committer.namespace,
+                            commitment: *commitment,
+                        },
+                        payload_hash: batch.payload_hash,
+                    };
+                    let commit = SoftCommit {
+                        tx_hash: tx_hash.clone(),
+                        pfb_broadcasted_at_ms: broadcasted_at,
+                        celestia_committed_at_ms: committed_at,
+                        celestia_block_time_ms,
+                        publish_latency_ms: celestia_block_time_ms
+                            .map(|timestamp| timestamp.saturating_sub(batch.metadata.timestamp)),
+                        backend_commit_latency_ms: committed_at
+                            .saturating_sub(batch.metadata.timestamp),
+                        batch_wait_ms: started_at.saturating_sub(batch.soft_confirmed_at),
+                        soft_to_pfb_broadcast_ms: broadcasted_at
+                            .saturating_sub(batch.soft_confirmed_at),
+                        broadcast_latency_ms: broadcasted_at.saturating_sub(started_at),
+                        confirmation_wait_ms: committed_at.saturating_sub(broadcasted_at),
+                    };
+                    history.publish(batch.sequence, cursor, commit).await;
+                }
+
+                let first = batches.first().expect("soft publish batch cannot be empty");
+                let last = batches.last().expect("soft publish batch cannot be empty");
                 info!(
-                    sequence = batch.sequence.0,
-                    height = batch.metadata.height,
-                    celestia_height = cursor.blob_ref.height,
-                    namespace = %hex29(cursor.blob_ref.namespace.0),
-                    commitment = %hex32(cursor.blob_ref.commitment.0),
-                    queued_for_ms = queued_for,
-                    publish_roundtrip_ms = now_millis().saturating_sub(started_at),
-                    "published soft-confirmed alto block to Celestia"
+                    first_sequence = first_sequence.0,
+                    last_sequence = last_sequence.0,
+                    first_height = first.metadata.height,
+                    last_height = last.metadata.height,
+                    batch_size = batches.len(),
+                    celestia_height = tx_info.height,
+                    namespace = %hex29(committer.namespace.0),
+                    tx_hash = %tx_hash,
+                    first_commitment = %hex32(commitments.first().expect("commitment exists").0),
+                    last_commitment = %hex32(commitments.last().expect("commitment exists").0),
+                    celestia_block_time_ms = ?celestia_block_time_ms,
+                    oldest_publish_latency_ms = ?celestia_block_time_ms.map(|timestamp| timestamp.saturating_sub(first.metadata.timestamp)),
+                    newest_publish_latency_ms = ?celestia_block_time_ms.map(|timestamp| timestamp.saturating_sub(last.metadata.timestamp)),
+                    oldest_queued_for_ms = committed_at.saturating_sub(first.metadata.timestamp),
+                    newest_queued_for_ms = committed_at.saturating_sub(last.metadata.timestamp),
+                    commit_latency_ms = committed_at.saturating_sub(started_at),
+                    "committed soft-confirmed alto blocks to Celestia"
                 );
                 break;
             }
             Err(error) => {
                 warn!(
-                    sequence = batch.sequence.0,
+                    first_sequence = first_sequence.0,
+                    last_sequence = last_sequence.0,
+                    batch_size = batches.len(),
                     error = %error,
-                    "soft-confirmed block publication failed; retrying"
+                    "soft-confirmed block batch confirmation failed; retrying"
                 );
                 time::sleep(Duration::from_secs(1)).await;
             }
+        }
+    }
+}
+
+fn celestia_blobs_for_soft_batches(
+    committer: &SoftCelestiaCommitter,
+    batches: &[SoftBatch],
+) -> Result<(Vec<CelestiaBlob>, Vec<BlobCommitment>), String> {
+    let mut blobs = Vec::with_capacity(batches.len());
+    let mut commitments = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let blob = CelestiaBlob::new(committer.celestia_namespace, batch.payload.to_vec(), None)
+            .map_err(|err| err.to_string())?;
+        commitments.push(BlobCommitment(*blob.commitment.hash()));
+        blobs.push(blob);
+    }
+    Ok((blobs, commitments))
+}
+
+async fn celestia_block_time_ms(committer: &SoftCelestiaCommitter, height: u64) -> Option<u64> {
+    if let Some(timestamp) = committer
+        .header_time_cache
+        .lock()
+        .await
+        .get(&height)
+        .copied()
+    {
+        return Some(timestamp);
+    }
+
+    match committer.header_client.header().get_by_height(height).await {
+        Ok(header) => {
+            let nanos = header.time().unix_timestamp_nanos();
+            let timestamp = u64::try_from(nanos / 1_000_000).ok()?;
+            committer
+                .header_time_cache
+                .lock()
+                .await
+                .insert(height, timestamp);
+            Some(timestamp)
+        }
+        Err(error) => {
+            warn!(
+                celestia_height = height,
+                error = %error,
+                "failed to fetch Celestia header timestamp"
+            );
+            None
         }
     }
 }
@@ -1120,7 +1473,30 @@ async fn run_replica_loop(
     }
 }
 
-async fn backend(config: &CelestiaConfig) -> CelestiaClientBackend {
+struct CelestiaClients {
+    backend: CelestiaClientBackend,
+    grpc: GrpcClient,
+    header: Arc<Client>,
+}
+
+async fn read_only_backend(config: &CelestiaConfig) -> CelestiaClientBackend {
+    let env_file =
+        load_env_file(config.env_file.as_deref()).expect("failed to read celestia.env_file");
+    let rpc_url = celestia_config_value(
+        config.rpc_url.as_ref(),
+        config.rpc_url_env.as_ref(),
+        &env_file,
+        "celestia.rpc_url",
+    );
+    let client = Client::builder()
+        .rpc_url(&rpc_url)
+        .build()
+        .await
+        .expect("failed to build read-only celestia-client");
+    CelestiaClientBackend::new(client)
+}
+
+async fn celestia_clients(config: &CelestiaConfig) -> CelestiaClients {
     let env_file =
         load_env_file(config.env_file.as_deref()).expect("failed to read celestia.env_file");
     let rpc_url = celestia_config_value(
@@ -1143,12 +1519,24 @@ async fn backend(config: &CelestiaConfig) -> CelestiaClientBackend {
         .build()
         .await
         .expect("failed to build celestia-client");
+    let header = Arc::new(
+        Client::builder()
+            .rpc_url(&rpc_url)
+            .grpc_url(&grpc_url)
+            .build()
+            .await
+            .expect("failed to build celestia header client"),
+    );
     let grpc = GrpcClient::builder()
         .url(grpc_url)
         .private_key_hex(&private_key_hex)
         .build()
         .expect("failed to build celestia-grpc client");
-    CelestiaClientBackend::with_submit_client(client, grpc)
+    CelestiaClients {
+        backend: CelestiaClientBackend::with_submit_client(client, grpc.clone()),
+        grpc,
+        header,
+    }
 }
 
 fn private_key_hex(config: &CelestiaConfig, env_file: &HashMap<String, String>) -> String {
@@ -1263,6 +1651,11 @@ fn namespace(value: &str) -> coro::NamespaceId {
     coro::NamespaceId(namespace)
 }
 
+fn celestia_namespace(namespace: coro::NamespaceId) -> Result<Namespace, String> {
+    namespace.validate().map_err(|err| err.to_string())?;
+    Namespace::from_raw(&namespace.0).map_err(|err| err.to_string())
+}
+
 fn publisher_config(prefix: &str, chain: &ChainConfig, batch: &BatchConfig) -> PublisherConfig {
     PublisherConfig {
         chain: chain.clone(),
@@ -1346,14 +1739,6 @@ fn hex(value: &[u8]) -> String {
 
 fn payload_hash(payload: &[u8]) -> [u8; 32] {
     Sha2::digest(payload).into()
-}
-
-fn submission_id(sequence: BatchNumber, payload_hash: [u8; 32]) -> SubmissionId {
-    let mut hasher = Sha2::new();
-    hasher.update(b"alto-coro.soft-sequencer.v1");
-    hasher.update(sequence.0.to_be_bytes());
-    hasher.update(payload_hash);
-    SubmissionId(hasher.finalize().into())
 }
 
 fn default_storage_dir() -> PathBuf {
@@ -1442,6 +1827,14 @@ const fn default_publish_queue() -> usize {
 
 const fn default_publish_concurrency() -> usize {
     8
+}
+
+const fn default_publish_batch_max_blocks() -> usize {
+    4
+}
+
+const fn default_publish_batch_max_delay_ms() -> u64 {
+    1_500
 }
 
 fn default_env_file() -> Option<PathBuf> {

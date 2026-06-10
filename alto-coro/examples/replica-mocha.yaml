@@ -8,8 +8,6 @@ celestia:
   # Must match the sequencer.
   env_file: .env
   rpc_url_env: CELESTIA_RPC_URL
-  grpc_url_env: CELESTIA_GRPC_URL
-  private_key_env: CELESTIA_PRIVATE_KEY_HEX
   namespace: 0000008e5f679bf7116c
 
 batch:
