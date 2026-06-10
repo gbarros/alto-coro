@@ -7,7 +7,8 @@ and Celestia blob publication.
 The demo path is intentionally small:
 
 - one sequencer builds simple `alto_types::Block` payloads,
-- Coro publishes each encoded block as a Celestia blob,
+- soft-confirmed blocks are held in memory and served immediately,
+- Coro publishes each encoded block as a Celestia blob in the background,
 - the sequencer serves Coro history over HTTP,
 - one or more replicas follow that history and verify Alto block continuity.
 
@@ -19,16 +20,28 @@ for quickly testing Alto-shaped blocks on Celestia Mocha.
 ```text
 alto-coro sequencer
   -> builds Alto block
-  -> submits batch through Coro
-  -> publishes blob to Celestia
-  -> stores local archive
-  -> serves /head, /cursor/:sequence, /payload/:sequence
+  -> stores in-memory soft-confirmation archive
+  -> publishes blob to Celestia in the background
+  -> serves Coro history and raw Alto block compatibility endpoints
 
 alto-coro replica
   -> polls sequencer history
   -> fetches payload from history server or Celestia exact refs
   -> checks parent/height/timestamp continuity
 ```
+
+By default `/head` is the canonical published head. `/archived-head` exposes
+the soft-confirmed head, which can run ahead of Celestia publication.
+
+The history server also exposes the subset of the original Alto indexer API
+that can be answered honestly in this PoC:
+
+- `GET /health`
+- `GET /block/latest`
+- `GET /block/<height>`
+
+Those block endpoints return raw encoded `alto_types::Block` payloads. They do
+not fabricate Simplex notarization or finalization certificates.
 
 The `alto-coro` executable does not start:
 
@@ -76,6 +89,18 @@ celestia:
 The namespace can be either a 10-byte hex suffix or a full 29-byte Celestia
 namespace.
 
+The demo sequencer defaults to soft confirmations:
+
+```yaml
+confirmation_mode: soft
+block_time_ms: 500
+publish_queue: 1024
+publish_concurrency: 8
+```
+
+Set `confirmation_mode: canonical` to restore the older behavior where each
+block waits for Celestia publication/readback before the next block is produced.
+
 ## Generate a Mocha Account
 
 Generate a local Celestia secp256k1 key:
@@ -105,13 +130,27 @@ publication with:
 - namespace,
 - blob commitment.
 
-The default block interval is controlled by:
+The soft-confirmation interval is controlled by:
 
 ```yaml
-block_time_ms: 6000
+block_time_ms: 500
 ```
 
-Effective production time is `Celestia submit/readback latency + block_time_ms`.
+In `soft` mode, block production is no longer gated by Celestia block time until
+the background publication queue fills. Soft publication is pipelined with
+`publish_concurrency` in-flight Celestia submissions so multiple Alto block
+blobs can be confirmed in the same Mocha block. Canonical publication still
+depends on Celestia submit/readback latency.
+
+Publication logs include:
+
+- `queued_for_ms`: time from Alto block timestamp until its publish task starts,
+- `publish_roundtrip_ms`: time spent broadcasting, confirming, and reading back
+  that blob.
+
+Unpublished soft-confirmed blocks are not recovered after a sequencer restart in
+this PoC. Once a block is published, replicas can follow it through the
+canonical published head.
 
 ## Run a Replica
 
@@ -128,11 +167,36 @@ sequencer_url: http://127.0.0.1:8081
 ```
 
 Multiple replicas can follow the same sequencer. Give each replica a distinct
-`storage_dir` and `partition_prefix`.
+`storage_dir` and `partition_prefix`. Replicas currently follow canonical
+published head, not soft head.
 
 Do not run multiple sequencers against the same namespace as peers. This PoC has
 no multi-writer consensus or fork choice; use one active sequencer, or give
 independent sequencers separate namespaces.
+
+## Run the Explorer
+
+The Alto explorer has a dedicated Coro mode that talks to the sequencer history
+server on `127.0.0.1:8081`.
+
+In a third terminal:
+
+```sh
+cd explorer
+npm ci
+REACT_APP_MODE=coro npm start
+```
+
+Open `http://localhost:3000`.
+
+Coro mode keeps the original explorer for the pieces that still match Alto
+blocks, but changes the live feed semantics:
+
+- **Soft** means the block is in the sequencer's local archive.
+- **Published** means Coro has produced a Celestia blob reference.
+
+It does not display Simplex seeds, notarizations, or finalizations because this
+PoC does not produce those artifacts.
 
 ## Reset Local State
 

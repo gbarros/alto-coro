@@ -8,7 +8,9 @@ Visualize `alto` activity.
 
 ## Modes
 
-The alto explorer can run in two modes: **public** (for deployed clusters) and **local** (for local development).
+The alto explorer can run in three modes: **public** (for deployed clusters),
+**local** (for local Simplex/indexer development), and **coro** (for the
+`alto-coro` Celestia DA proof-of-concept).
 
 ### Public Mode (Default)
 
@@ -78,6 +80,51 @@ To run in local mode:
 REACT_APP_MODE=local npm start
 ```
 
+### Coro Mode
+
+Coro mode is used with the `alto-coro` sequencer. It does not expect Alto
+Simplex seed, notarization, or finalization certificates. Instead, it polls the
+Coro history server:
+
+- `GET /archived-head` for the soft-confirmed head,
+- `GET /status/<sequence>` for soft vs published status,
+- `GET /payload/<sequence>` for encoded `alto_types::Block` payloads,
+- `GET /block/latest` or `GET /block/<height>` for search compatibility.
+
+The timeline labels are adapted accordingly:
+
+- **Soft** means the sequencer has built and archived the block locally.
+- **Published** means Coro has a Celestia blob reference for that block.
+
+Populate `src/coro_config.ts`:
+
+```typescript
+// Backend URL (http:// is used automatically in coro mode)
+export const BACKEND_URL = "localhost:8081";
+
+// Not used in coro mode, but kept for the shared explorer config shape.
+export const PUBLIC_KEY_HEX = "00";
+
+// Empty locations array (map will be hidden)
+export const LOCATIONS: [[number, number], string][] = [];
+```
+
+Start the `alto-coro` sequencer from the repository root:
+
+```bash
+cargo run -p alto-coro -- run alto-coro/examples/sequencer-mocha.yaml
+```
+
+Then start the explorer:
+
+```bash
+cd explorer
+npm ci
+REACT_APP_MODE=coro npm start
+```
+
+Open `http://localhost:3000`.
+
 ## Development
 
 ### Build the app
@@ -88,6 +135,9 @@ npm run build
 
 # Local mode
 REACT_APP_MODE=local npm run build
+
+# Coro mode
+REACT_APP_MODE=coro npm run build
 ```
 
 _This will compile the WASM module from `alto-types` before building the React app._

@@ -264,10 +264,17 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
                 )
             : 0;
 
+    const isCoro = MODE === 'coro';
     const tooltips = {
-        blockTime: "The median difference between consecutive block timestamps.<br><br><i>This is functionally equivalent to the average validator's time to lock (unlike your browser, validators are connected directly to each other instead of an intermediary streaming layer).</i>",
-        timeToLock: "The median latency from block proposal to receiving 2f+1 votes, as observed by your browser.<br><br><i>Locked blocks must be included in the canonical chain if the view is not nullified.</i>",
-        timeToFinalize: "The median latency from block proposal to receiving 2f+1 finalizes, as observed by your browser.<br><br><i>Once finalized, a block is immutable.</i>"
+        blockTime: isCoro
+            ? "The median difference between consecutive Alto block timestamps produced by the local Coro sequencer. This follows alto-coro block_time_ms, not Celestia block time."
+            : "The median difference between consecutive block timestamps.<br><br><i>This is functionally equivalent to the average validator's time to lock (unlike your browser, validators are connected directly to each other instead of an intermediary streaming layer).</i>",
+        timeToLock: isCoro
+            ? "The median latency from block timestamp to observing the block in the sequencer's soft-confirmed archive."
+            : "The median latency from block proposal to receiving 2f+1 votes, as observed by your browser.<br><br><i>Locked blocks must be included in the canonical chain if the view is not nullified.</i>",
+        timeToFinalize: isCoro
+            ? "The median latency from Alto block timestamp to the browser observing that Coro has a Celestia blob reference. This includes publish queue time, Celestia submission/readback, RPC/provider latency, and explorer polling."
+            : "The median latency from block proposal to receiving 2f+1 finalizes, as observed by your browser.<br><br><i>Once finalized, a block is immutable.</i>"
     };
 
     return (
@@ -290,7 +297,7 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
                     <div className="source-label">CLUSTER</div>
                     <Tooltip content={tooltips.blockTime}>
                         <div className="metric-container">
-                            <div className="stat-label">Block Time</div>
+                            <div className="stat-label">{isCoro ? "Soft Interval" : "Block Time"}</div>
                             <div className="stat-value">
                                 {medianBlockTime > 0 ? `${medianBlockTime}ms` : "N/A"}
                             </div>
@@ -303,7 +310,7 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
                     <div className="browser-metrics-container">
                         <div className="metric-container">
                             <Tooltip content={tooltips.timeToLock}>
-                                <div className="stat-label">Locked</div>
+                                <div className="stat-label">{isCoro ? "Soft" : "Locked"}</div>
                                 <div className="stat-value">
                                     {medianTimeToLock > 0 ? `${medianTimeToLock}ms` : "N/A"}
                                 </div>
@@ -312,7 +319,7 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
 
                         <div className="metric-container">
                             <Tooltip content={tooltips.timeToFinalize}>
-                                <div className="stat-label">Finalized</div>
+                                <div className="stat-label">{isCoro ? "Publish Latency" : "Finalized"}</div>
                                 <div className="stat-value">
                                     {medianTimeToFinalize > 0 ? `${medianTimeToFinalize}ms` : "N/A"}
                                 </div>
@@ -323,8 +330,9 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
             </div>
 
             <div className="stats-disclaimer">
-                All latency measurements made by your browser are only performed after verifying the integrity of incoming artifacts with the network key.
-                Local clock skew is automatically detected and corrected.
+                {isCoro
+                    ? "Coro mode displays soft confirmations from the sequencer and canonical publication once Celestia blob refs are available."
+                    : "All latency measurements made by your browser are only performed after verifying the integrity of incoming artifacts with the network key. Local clock skew is automatically detected and corrected."}
             </div>
         </div >
     );

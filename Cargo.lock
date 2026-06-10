@@ -98,6 +98,7 @@ version = "2026.5.0"
 dependencies = [
  "alto-types",
  "async-trait",
+ "axum 0.8.9",
  "bytes",
  "celestia-client",
  "celestia-grpc",
@@ -113,8 +114,10 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "serde_yaml",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "tower-http",
  "tracing",
  "tracing-subscriber 0.3.23",
 ]

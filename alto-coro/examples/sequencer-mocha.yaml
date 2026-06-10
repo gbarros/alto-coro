@@ -2,7 +2,10 @@ storage_dir: local/alto-coro-sequencer
 partition_prefix: alto-coro-sequencer
 history_listen: 127.0.0.1:8081
 log_level: info
-block_time_ms: 6000
+confirmation_mode: soft
+block_time_ms: 500
+publish_queue: 1024
+publish_concurrency: 8
 serve_payloads: true
 
 celestia:

@@ -1,9 +1,10 @@
 import * as globalConfig from './global_config';
 import * as usaConfig from './usa_config';
 import * as localConfig from './local_config';
+import * as coroConfig from './coro_config';
 
-export type Cluster = 'global' | 'usa' | 'local';
-export type Mode = 'public' | 'local';
+export type Cluster = 'global' | 'usa' | 'local' | 'coro';
+export type Mode = 'public' | 'local' | 'coro';
 
 export interface ClusterConfig {
     BACKEND_URL: string;
@@ -38,11 +39,23 @@ const localClusterConfig: ClusterConfig = {
     description: `A local test cluster running on localhost.`,
 };
 
-export const DEFAULT_CLUSTER: Cluster = MODE === 'public' ? 'global' : 'local';
+const coroClusterConfig: ClusterConfig = {
+    ...coroConfig,
+    name: 'Alto Coro',
+    description: `A local Coro/Celestia sequencer. Soft-confirmed blocks are archived locally; canonical blocks are published to Celestia.`,
+};
+
+export const DEFAULT_CLUSTER: Cluster = MODE === 'public' ? 'global' : MODE === 'coro' ? 'coro' : 'local';
 
 export const getClusterConfig = (cluster: Cluster): ClusterConfig => {
+    if (MODE === 'coro') {
+        return coroClusterConfig;
+    }
     if (MODE === 'local') {
         return localClusterConfig;
+    }
+    if (cluster === 'coro') {
+        return coroClusterConfig;
     }
     if (cluster === 'local') {
         return localClusterConfig;
@@ -51,6 +64,9 @@ export const getClusterConfig = (cluster: Cluster): ClusterConfig => {
 };
 
 export const getClusters = (): Record<Cluster, ClusterConfig> => {
+    if (MODE === 'coro') {
+        return { coro: coroClusterConfig } as Record<Cluster, ClusterConfig>;
+    }
     if (MODE === 'local') {
         return { local: localClusterConfig } as Record<Cluster, ClusterConfig>;
     }

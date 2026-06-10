@@ -141,14 +141,15 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, clusterConfi
         }
 
         const { BACKEND_URL, PUBLIC_KEY_HEX } = clusterConfig;
-        const protocol = MODE === 'local' ? 'http' : 'https';
+        const protocol = MODE === 'local' || MODE === 'coro' ? 'http' : 'https';
         const baseUrl = `${protocol}://${BACKEND_URL}`;
         const PUBLIC_KEY = hexToUint8Array(PUBLIC_KEY_HEX);
 
         let endpoint = '';
-        switch (searchType) {
+        const effectiveSearchType = MODE === 'coro' ? 'block' : searchType;
+        switch (effectiveSearchType) {
             case 'block':
-                endpoint = `/block/${typeof query === 'number' ? numberToU64Hex(query) : query}`;
+                endpoint = `/block/${typeof query === 'number' ? (MODE === 'coro' ? String(query) : numberToU64Hex(query)) : query}`;
                 break;
             case 'notarization':
                 endpoint = `/notarization/${typeof query === 'number' ? numberToU64Hex(query) : query}`;
@@ -174,7 +175,11 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, clusterConfi
             const data = new Uint8Array(arrayBuffer);
 
             try {
-                if (searchType === 'seed') {
+                if (MODE === 'coro') {
+                    const result = parse_block(data);
+                    if (!result) throw new Error("Failed to parse Coro block data");
+                    return result;
+                } else if (searchType === 'seed') {
                     const result = parse_seed(PUBLIC_KEY, data);
                     if (!result) throw new Error("Failed to parse seed data");
                     return result;
@@ -323,10 +328,16 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, clusterConfi
                         <h3>Help</h3>
                         <p>You can search for:</p>
                         <ul>
-                            <li><strong>Block</strong>: by height (number), digest (hex), or "latest"</li>
-                            <li><strong>Notarization</strong>: by view number or "latest"</li>
-                            <li><strong>Finalization</strong>: by view number or "latest"</li>
-                            <li><strong>Seed</strong>: by view number or "latest"</li>
+                            {MODE === 'coro' ? (
+                                <li><strong>Block</strong>: by height number or "latest"</li>
+                            ) : (
+                                <>
+                                    <li><strong>Block</strong>: by height (number), digest (hex), or "latest"</li>
+                                    <li><strong>Notarization</strong>: by view number or "latest"</li>
+                                    <li><strong>Finalization</strong>: by view number or "latest"</li>
+                                    <li><strong>Seed</strong>: by view number or "latest"</li>
+                                </>
+                            )}
                         </ul>
                         <p>You can also search for ranges (e.g., "10..20") to get multiple results.</p>
                     </div>
@@ -338,12 +349,13 @@ const SearchModal: React.FC<SearchModalProps> = ({ isOpen, onClose, clusterConfi
                             <div className="search-type-selector">
                                 <label>Type:</label>
                                 <select
-                                    value={searchType}
+                                    value={MODE === 'coro' ? 'block' : searchType}
                                     onChange={(e) => setSearchType(e.target.value as SearchType)}
+                                    disabled={MODE === 'coro'}
                                 >
-                                    <option value="seed">Seed</option>
-                                    <option value="notarization">Notarization</option>
-                                    <option value="finalization">Finalization</option>
+                                    {MODE !== 'coro' && <option value="seed">Seed</option>}
+                                    {MODE !== 'coro' && <option value="notarization">Notarization</option>}
+                                    {MODE !== 'coro' && <option value="finalization">Finalization</option>}
                                     <option value="block">Block</option>
                                 </select>
                             </div>

@@ -1,5 +1,12 @@
 use alto_types::{Block, Context, EPOCH};
 use async_trait::async_trait;
+use axum::{
+    extract::{Path as AxumPath, State as AxumState},
+    http::{header, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
 use bytes::{Buf, BufMut, Bytes};
 use celestia_client::tx::SigningKey;
 use celestia_client::types::state::AccAddress;
@@ -21,20 +28,22 @@ use coro::{
         Application, AppliedBatch, ExecutedBatch, Replica, ReplicaApplication, ReplicaConfig,
         SingleSequencer,
     },
-    BatchCursor, BatchNumber, BatchPolicy, ChainConfig, PublisherConfig, ReaderConfig, RetryConfig,
-    VerificationMode,
+    BatchCursor, BatchNumber, BatchPolicy, ChainConfig, PublishRequest, Publisher, PublisherConfig,
+    ReaderConfig, RetryConfig, SubmissionId, VerificationMode,
 };
 use coro_demo::{HistoryServerConfig, HttpReplicaSource};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as Sha2Digest, Sha256 as Sha2};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     error::Error,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::time;
+use tokio::{sync::mpsc, task::JoinSet, time};
+use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
 const DEFAULT_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -85,6 +94,12 @@ struct SequencerFile {
     celestia: CelestiaConfig,
     #[serde(default = "default_block_time_ms")]
     block_time_ms: u64,
+    #[serde(default = "default_confirmation_mode")]
+    confirmation_mode: ConfirmationMode,
+    #[serde(default = "default_publish_queue")]
+    publish_queue: usize,
+    #[serde(default = "default_publish_concurrency")]
+    publish_concurrency: usize,
     #[serde(default = "default_serve_payloads")]
     serve_payloads: bool,
 }
@@ -178,6 +193,13 @@ impl Default for BatchConfig {
             read_timeout_ms: default_read_timeout_ms(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ConfirmationMode {
+    Soft,
+    Canonical,
 }
 
 #[derive(Clone, Debug)]
@@ -333,6 +355,100 @@ impl Application for BlockBuilder {
     }
 }
 
+#[derive(Clone)]
+struct SoftBatch {
+    sequence: BatchNumber,
+    payload: Bytes,
+    payload_hash: [u8; 32],
+    metadata: BlockMeta,
+    cursor: Option<BatchCursor>,
+}
+
+#[derive(Default)]
+struct SoftHistoryState {
+    batches: BTreeMap<BatchNumber, SoftBatch>,
+    archived_head: Option<BatchNumber>,
+    published_head: Option<BatchNumber>,
+}
+
+#[derive(Default)]
+struct SoftSequencerHistory {
+    state: tokio::sync::Mutex<SoftHistoryState>,
+}
+
+impl SoftSequencerHistory {
+    async fn archive(&self, batch: SoftBatch) {
+        let mut state = self.state.lock().await;
+        state.archived_head = Some(batch.sequence);
+        state.batches.insert(batch.sequence, batch);
+    }
+
+    async fn publish(&self, sequence: BatchNumber, cursor: BatchCursor) {
+        let mut state = self.state.lock().await;
+        if let Some(batch) = state.batches.get_mut(&sequence) {
+            batch.cursor = Some(cursor);
+        }
+
+        let mut next = match state.published_head {
+            Some(head) => head.0.saturating_add(1),
+            None => 0,
+        };
+        while state
+            .batches
+            .get(&BatchNumber(next))
+            .and_then(|batch| batch.cursor.as_ref())
+            .is_some()
+        {
+            state.published_head = Some(BatchNumber(next));
+            next = next.saturating_add(1);
+        }
+    }
+}
+
+#[async_trait]
+impl coro_demo::SequencerHistory for SoftSequencerHistory {
+    async fn head(&self) -> coro::Result<Option<BatchNumber>> {
+        Ok(self.state.lock().await.published_head)
+    }
+
+    async fn archived_head(&self) -> coro::Result<Option<BatchNumber>> {
+        Ok(self.state.lock().await.archived_head)
+    }
+
+    async fn cursor(&self, sequence: BatchNumber) -> coro::Result<Option<BatchCursor>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .batches
+            .get(&sequence)
+            .and_then(|batch| batch.cursor.clone()))
+    }
+
+    async fn status(&self, sequence: BatchNumber) -> coro::Result<Option<coro::BatchStatus>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .batches
+            .get(&sequence)
+            .map(|batch| match batch.cursor.clone() {
+                Some(cursor) => coro::BatchStatus::Published(cursor),
+                None => coro::BatchStatus::Archived,
+            }))
+    }
+
+    async fn payload(&self, sequence: BatchNumber) -> coro::Result<Option<Bytes>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .batches
+            .get(&sequence)
+            .map(|batch| batch.payload.clone()))
+    }
+}
+
 struct BlockApplier {
     chain: Arc<Mutex<ChainState>>,
 }
@@ -434,52 +550,99 @@ fn run_sequencer(path: PathBuf) -> Result<(), Box<dyn Error>> {
         let signer = signer(&config.private_key, config.signer_seed);
         let backend = backend(&config.celestia).await;
         let chain_config = chain_config(&config.celestia, &config.batch);
-        let builder = BlockBuilder::new(signer.public_key());
-        let chain = builder.chain();
-        let sequencer = Arc::new(SingleSequencer::new(
-            context.child("sequencer"),
-            backend,
-            publisher_config(&config.partition_prefix, &chain_config, &config.batch),
-            reader_config(&chain_config, &config.batch),
-            sequencer_config(&config.partition_prefix, &config.batch),
-            builder,
-        ));
 
-        let recovery = sequencer
-            .recover()
-            .await
-            .expect("sequencer recovery failed");
-        info!(
-            finalized = recovery.finalized_batches.len(),
-            pending = recovery.pending_batches.len(),
-            resumed = recovery.resumed_batches.len(),
-            "sequencer recovered"
-        );
+        match config.confirmation_mode {
+            ConfirmationMode::Soft => {
+                let history = Arc::new(SoftSequencerHistory::default());
+                let history_trait = history.clone() as Arc<dyn coro_demo::SequencerHistory>;
+                let history_listen = config.history_listen;
+                let history_handle = tokio::spawn(async move {
+                    serve_history(
+                        history_trait,
+                        HistoryServerConfig {
+                            serve_payloads: config.serve_payloads,
+                        },
+                        history_listen,
+                    )
+                    .await
+                    .expect("coro history server exited");
+                });
+                info!(listen = %history_listen, mode = "soft", "coro history HTTP listening");
 
-        let history = sequencer.clone() as Arc<dyn coro_demo::SequencerHistory>;
-        let history_listen = config.history_listen;
-        let history_handle = tokio::spawn(async move {
-            coro_demo::serve(
-                history,
-                HistoryServerConfig {
-                    serve_payloads: config.serve_payloads,
-                },
-                history_listen,
-            )
-            .await
-            .expect("coro history server exited");
-        });
-        info!(listen = %history_listen, "coro history HTTP listening");
+                let publisher = Publisher::new(
+                    context.child("publisher"),
+                    backend,
+                    publisher_config(&config.partition_prefix, &chain_config, &config.batch),
+                );
+                let (publish_tx, publish_rx) = mpsc::channel(config.publish_queue.max(1));
+                let publish_handle = tokio::spawn(run_soft_publish_loop(
+                    Arc::new(publisher),
+                    history.clone(),
+                    publish_rx,
+                    config.publish_concurrency.max(1),
+                ));
+                let loop_handle = tokio::spawn(run_soft_sequencer_loop(
+                    BlockBuilder::new(signer.public_key()),
+                    history,
+                    publish_tx,
+                    Duration::from_millis(config.block_time_ms),
+                ));
 
-        let loop_handle = tokio::spawn(run_sequencer_loop(
-            sequencer.clone(),
-            chain,
-            Duration::from_millis(config.block_time_ms),
-        ));
+                tokio::select! {
+                    result = history_handle => error!(?result, "history HTTP task exited"),
+                    result = publish_handle => error!(?result, "soft publisher task exited"),
+                    result = loop_handle => error!(?result, "soft sequencer loop exited"),
+                }
+            }
+            ConfirmationMode::Canonical => {
+                let builder = BlockBuilder::new(signer.public_key());
+                let chain = builder.chain();
+                let sequencer = Arc::new(SingleSequencer::new(
+                    context.child("sequencer"),
+                    backend,
+                    publisher_config(&config.partition_prefix, &chain_config, &config.batch),
+                    reader_config(&chain_config, &config.batch),
+                    sequencer_config(&config.partition_prefix, &config.batch),
+                    builder,
+                ));
 
-        tokio::select! {
-            result = history_handle => error!(?result, "history HTTP task exited"),
-            result = loop_handle => error!(?result, "sequencer loop exited"),
+                let recovery = sequencer
+                    .recover()
+                    .await
+                    .expect("sequencer recovery failed");
+                info!(
+                    finalized = recovery.finalized_batches.len(),
+                    pending = recovery.pending_batches.len(),
+                    resumed = recovery.resumed_batches.len(),
+                    "sequencer recovered"
+                );
+
+                let history = sequencer.clone() as Arc<dyn coro_demo::SequencerHistory>;
+                let history_listen = config.history_listen;
+                let history_handle = tokio::spawn(async move {
+                    serve_history(
+                        history,
+                        HistoryServerConfig {
+                            serve_payloads: config.serve_payloads,
+                        },
+                        history_listen,
+                    )
+                    .await
+                    .expect("coro history server exited");
+                });
+                info!(listen = %history_listen, mode = "canonical", "coro history HTTP listening");
+
+                let loop_handle = tokio::spawn(run_sequencer_loop(
+                    sequencer.clone(),
+                    chain,
+                    Duration::from_millis(config.block_time_ms),
+                ));
+
+                tokio::select! {
+                    result = history_handle => error!(?result, "history HTTP task exited"),
+                    result = loop_handle => error!(?result, "sequencer loop exited"),
+                }
+            }
         }
     });
     Ok(())
@@ -542,6 +705,350 @@ async fn run_sequencer_loop(
             }
         }
         time::sleep(block_time).await;
+    }
+}
+
+#[derive(Clone)]
+struct HistoryApiState {
+    history: Arc<dyn coro_demo::SequencerHistory>,
+    serve_payloads: bool,
+}
+
+fn history_router(
+    history: Arc<dyn coro_demo::SequencerHistory>,
+    config: HistoryServerConfig,
+) -> Router {
+    let state = HistoryApiState {
+        history: history.clone(),
+        serve_payloads: config.serve_payloads,
+    };
+    Router::new()
+        .route("/health", get(health))
+        .route("/healthz", get(health))
+        .route("/head", get(history_head))
+        .route("/archived-head", get(history_archived_head))
+        .route("/status/{sequence}", get(history_status))
+        .route("/cursor/{sequence}", get(history_cursor))
+        .route("/payload/{sequence}", get(history_payload))
+        .route("/block/{query}", get(block_get))
+        .with_state(state)
+        .layer(CorsLayer::permissive())
+}
+
+async fn serve_history(
+    history: Arc<dyn coro_demo::SequencerHistory>,
+    config: HistoryServerConfig,
+    bind: SocketAddr,
+) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    axum::serve(listener, history_router(history, config)).await
+}
+
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+#[derive(Serialize)]
+struct HeadResponse {
+    head: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum StatusResponse {
+    Archived,
+    Published { cursor: CursorResponse },
+}
+
+#[derive(Serialize)]
+struct CursorResponse {
+    sequence: u64,
+    blob_ref: BlobRefResponse,
+    payload_hash: String,
+}
+
+#[derive(Serialize)]
+struct BlobRefResponse {
+    height: u64,
+    namespace: String,
+    commitment: String,
+}
+
+impl From<BatchCursor> for CursorResponse {
+    fn from(cursor: BatchCursor) -> Self {
+        Self {
+            sequence: cursor.sequence.0,
+            blob_ref: BlobRefResponse {
+                height: cursor.blob_ref.height,
+                namespace: hex29(cursor.blob_ref.namespace.0),
+                commitment: hex32(cursor.blob_ref.commitment.0),
+            },
+            payload_hash: hex(cursor.payload_hash.as_slice()),
+        }
+    }
+}
+
+impl From<coro::BatchStatus> for StatusResponse {
+    fn from(status: coro::BatchStatus) -> Self {
+        match status {
+            coro::BatchStatus::Archived => Self::Archived,
+            coro::BatchStatus::Published(cursor) => Self::Published {
+                cursor: cursor.into(),
+            },
+        }
+    }
+}
+
+async fn history_head(AxumState(state): AxumState<HistoryApiState>) -> impl IntoResponse {
+    match state.history.head().await {
+        Ok(head) => axum::Json(HeadResponse {
+            head: head.map(|head| head.0),
+        })
+        .into_response(),
+        Err(error) => {
+            warn!(error = %error, "failed to load published head");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn history_archived_head(AxumState(state): AxumState<HistoryApiState>) -> impl IntoResponse {
+    match state.history.archived_head().await {
+        Ok(head) => axum::Json(HeadResponse {
+            head: head.map(|head| head.0),
+        })
+        .into_response(),
+        Err(error) => {
+            warn!(error = %error, "failed to load archived head");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn history_status(
+    AxumPath(sequence): AxumPath<u64>,
+    AxumState(state): AxumState<HistoryApiState>,
+) -> impl IntoResponse {
+    match state.history.status(BatchNumber(sequence)).await {
+        Ok(Some(status)) => axum::Json(StatusResponse::from(status)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            warn!(sequence, error = %error, "failed to load batch status");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn history_cursor(
+    AxumPath(sequence): AxumPath<u64>,
+    AxumState(state): AxumState<HistoryApiState>,
+) -> impl IntoResponse {
+    match state.history.cursor(BatchNumber(sequence)).await {
+        Ok(Some(cursor)) => axum::Json(CursorResponse::from(cursor)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            warn!(sequence, error = %error, "failed to load batch cursor");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn history_payload(
+    AxumPath(sequence): AxumPath<u64>,
+    AxumState(state): AxumState<HistoryApiState>,
+) -> impl IntoResponse {
+    if !state.serve_payloads {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match state.history.payload(BatchNumber(sequence)).await {
+        Ok(Some(payload)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            payload,
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            warn!(sequence, error = %error, "failed to load batch payload");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn block_get(
+    AxumPath(query): AxumPath<String>,
+    AxumState(state): AxumState<HistoryApiState>,
+) -> impl IntoResponse {
+    if !state.serve_payloads {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let sequence = match payload_sequence(&state.history, &query).await {
+        Ok(Some(sequence)) => sequence,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            warn!(query, error = %error, "failed to resolve block query");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
+    match state.history.payload(sequence).await {
+        Ok(Some(payload)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            payload,
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            warn!(sequence = sequence.0, error = %error, "failed to load block payload");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn payload_sequence(
+    history: &Arc<dyn coro_demo::SequencerHistory>,
+    query: &str,
+) -> Result<Option<BatchNumber>, Box<dyn Error>> {
+    if query == "latest" {
+        return Ok(history.archived_head().await?);
+    }
+
+    if let Some(height) = parse_u64_query(query) {
+        if height == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(BatchNumber(height - 1)));
+    }
+
+    Ok(None)
+}
+
+fn parse_u64_query(query: &str) -> Option<u64> {
+    if let Ok(value) = query.parse::<u64>() {
+        return Some(value);
+    }
+    let raw = from_hex(query)?;
+    if raw.len() != 8 {
+        return None;
+    }
+    let bytes: [u8; 8] = raw.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
+
+async fn run_soft_sequencer_loop(
+    mut builder: BlockBuilder,
+    history: Arc<SoftSequencerHistory>,
+    publish_tx: mpsc::Sender<SoftBatch>,
+    block_time: Duration,
+) {
+    let mut sequence = BatchNumber(0);
+    loop {
+        match builder.execute_batch(sequence, vec![sequence.0 + 1]).await {
+            Ok(executed) => {
+                let payload_hash = payload_hash(executed.payload.as_ref());
+                let batch = SoftBatch {
+                    sequence,
+                    payload: executed.payload,
+                    payload_hash,
+                    metadata: executed.metadata,
+                    cursor: None,
+                };
+                history.archive(batch.clone()).await;
+                info!(
+                    sequence = sequence.0,
+                    height = batch.metadata.height,
+                    digest = ?batch.metadata.digest,
+                    payload_bytes = batch.payload.len(),
+                    "soft-confirmed alto block"
+                );
+                if publish_tx.send(batch).await.is_err() {
+                    warn!("soft publish queue closed");
+                    return;
+                }
+                sequence = BatchNumber(sequence.0.saturating_add(1));
+            }
+            Err(error) => warn!(error = %error, "soft sequencer failed to build block"),
+        }
+        time::sleep(block_time).await;
+    }
+}
+
+async fn run_soft_publish_loop(
+    publisher: Arc<Publisher<runtime_tokio::Context, CelestiaClientBackend>>,
+    history: Arc<SoftSequencerHistory>,
+    mut publish_rx: mpsc::Receiver<SoftBatch>,
+    publish_concurrency: usize,
+) {
+    let mut in_flight = JoinSet::new();
+    info!(publish_concurrency, "soft publisher pipeline started");
+    while let Some(batch) = publish_rx.recv().await {
+        while in_flight.len() >= publish_concurrency {
+            if let Some(result) = in_flight.join_next().await {
+                if let Err(error) = result {
+                    warn!(error = %error, "soft publish task failed");
+                }
+            }
+        }
+
+        let publisher = publisher.clone();
+        let history = history.clone();
+        in_flight.spawn(async move {
+            publish_soft_batch(publisher, history, batch).await;
+        });
+    }
+
+    while let Some(result) = in_flight.join_next().await {
+        if let Err(error) = result {
+            warn!(error = %error, "soft publish task failed");
+        }
+    }
+}
+
+async fn publish_soft_batch(
+    publisher: Arc<Publisher<runtime_tokio::Context, CelestiaClientBackend>>,
+    history: Arc<SoftSequencerHistory>,
+    batch: SoftBatch,
+) {
+    let queued_for = now_millis().saturating_sub(batch.metadata.timestamp);
+    loop {
+        let started_at = now_millis();
+        match publisher
+            .publish(PublishRequest {
+                id: submission_id(batch.sequence, batch.payload_hash),
+                payload: batch.payload.clone(),
+            })
+            .await
+        {
+            Ok(receipt) => {
+                let cursor = BatchCursor {
+                    sequence: batch.sequence,
+                    blob_ref: receipt.blob_ref,
+                    payload_hash: batch.payload_hash,
+                };
+                history.publish(batch.sequence, cursor.clone()).await;
+                info!(
+                    sequence = batch.sequence.0,
+                    height = batch.metadata.height,
+                    celestia_height = cursor.blob_ref.height,
+                    namespace = %hex29(cursor.blob_ref.namespace.0),
+                    commitment = %hex32(cursor.blob_ref.commitment.0),
+                    queued_for_ms = queued_for,
+                    publish_roundtrip_ms = now_millis().saturating_sub(started_at),
+                    "published soft-confirmed alto block to Celestia"
+                );
+                break;
+            }
+            Err(error) => {
+                warn!(
+                    sequence = batch.sequence.0,
+                    error = %error,
+                    "soft-confirmed block publication failed; retrying"
+                );
+                time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 
@@ -837,6 +1344,18 @@ fn hex(value: &[u8]) -> String {
     out
 }
 
+fn payload_hash(payload: &[u8]) -> [u8; 32] {
+    Sha2::digest(payload).into()
+}
+
+fn submission_id(sequence: BatchNumber, payload_hash: [u8; 32]) -> SubmissionId {
+    let mut hasher = Sha2::new();
+    hasher.update(b"alto-coro.soft-sequencer.v1");
+    hasher.update(sequence.0.to_be_bytes());
+    hasher.update(payload_hash);
+    SubmissionId(hasher.finalize().into())
+}
+
 fn default_storage_dir() -> PathBuf {
     PathBuf::from("local/alto-coro-sequencer")
 }
@@ -902,7 +1421,7 @@ const fn default_read_timeout_ms() -> u64 {
 }
 
 const fn default_block_time_ms() -> u64 {
-    6_000
+    500
 }
 
 const fn default_sync_interval_ms() -> u64 {
@@ -911,6 +1430,18 @@ const fn default_sync_interval_ms() -> u64 {
 
 const fn default_serve_payloads() -> bool {
     true
+}
+
+const fn default_confirmation_mode() -> ConfirmationMode {
+    ConfirmationMode::Soft
+}
+
+const fn default_publish_queue() -> usize {
+    1024
+}
+
+const fn default_publish_concurrency() -> usize {
+    8
 }
 
 fn default_env_file() -> Option<PathBuf> {

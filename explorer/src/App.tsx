@@ -2,9 +2,9 @@ import React, { useEffect, useState, useRef, useCallback, useMemo } from "react"
 import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
 import { DivIcon, LatLng } from "leaflet";
 import "leaflet/dist/leaflet.css";
-import init, { parse_seed, parse_notarized, parse_finalized, leader_index } from "./alto_types/alto_types.js";
+import init, { parse_seed, parse_notarized, parse_finalized, parse_block, leader_index } from "./alto_types/alto_types.js";
 import { getClusterConfig, getClusters, Cluster, DEFAULT_CLUSTER, MODE } from "./config";
-import { SeedJs, NotarizedJs, FinalizedJs, ViewData } from "./types";
+import { SeedJs, NotarizedJs, FinalizedJs, BlockJs, ViewData } from "./types";
 import { hexToUint8Array, hexUint8Array } from "./utils";
 import "./App.css";
 import AboutModal from './AboutModal';
@@ -39,6 +39,11 @@ const getInitialCluster = (): Cluster => {
 const SCALE_DURATION = 500; // 500ms
 const TIMEOUT_DURATION = 5000; // 5s
 const HEALTH_CHECK_INTERVAL = 60000; // Check health every minute
+const CORO_POLL_INTERVAL = 1000;
+const CORO_REQUEST_TIMEOUT = 3000;
+const CORO_SOFT_WINDOW = 35;
+const CORO_PUBLISHED_WINDOW = 15;
+const CORO_FETCH_CONCURRENCY = 8;
 
 const center = new LatLng(0, 0);
 const markerIcon = new DivIcon({
@@ -113,6 +118,11 @@ const App: React.FC = () => {
   const handleFinalizedRef = useRef<typeof handleFinalization>(null!);
   const isInitializedRef = useRef(false);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const coroPollInFlightRef = useRef(false);
+  const coroWasmInitRef = useRef<Promise<void> | null>(null);
+  const coroBlockCacheRef = useRef<Map<number, BlockJs>>(new Map());
+  const coroStatusCacheRef = useRef<Map<number, "archived" | "published">>(new Map());
+  const coroLastArchivedHeadRef = useRef<number | null>(null);
 
   const performClusterSwitch = useCallback((cluster: Cluster) => {
     console.log(`Switching to ${cluster} cluster`);
@@ -169,7 +179,7 @@ const App: React.FC = () => {
   // Health check function
   const checkHealth = useCallback(async () => {
     try {
-      const protocol = MODE === 'local' ? 'http' : 'https';
+      const protocol = MODE === 'local' || MODE === 'coro' ? 'http' : 'https';
       const response = await fetch(`${protocol}://${BACKEND_URL}/health`, {
         method: "GET",
         headers: {
@@ -590,8 +600,220 @@ const App: React.FC = () => {
     handleFinalizedRef.current = handleFinalization;
   }, [handleFinalization]);
 
+  const upsertCoroBlocks = useCallback((records: Array<{ block: BlockJs; status: "archived" | "published" }>) => {
+    if (records.length === 0) return;
+
+    const currentTime = adjustTime(Date.now());
+    let maxView: number | null = null;
+
+    setViews((prevViews) => {
+      let newViews = [...prevViews];
+
+      for (const { block, status } of records) {
+        const view = block.height;
+        const blockTime = Number(block.timestamp) || currentTime;
+        const index = newViews.findIndex((v) => v.view === view);
+        const existing = index >= 0 ? newViews[index] : undefined;
+        const alreadyFinalized = existing?.status === "finalized";
+        const nextStatus = status === "published" || alreadyFinalized ? "finalized" : "notarized";
+        const notarizationTime = existing?.notarizationTime ?? currentTime;
+        const finalizationTime =
+          nextStatus === "finalized" ? existing?.finalizationTime ?? currentTime : existing?.finalizationTime;
+
+        const nextView: ViewData = {
+          ...existing,
+          view,
+          status: nextStatus,
+          startTime: existing?.startTime ?? blockTime,
+          notarizationTime,
+          finalizationTime,
+          block,
+          timeoutId: undefined,
+          actualNotarizationLatency:
+            existing?.actualNotarizationLatency ?? Math.max(0, notarizationTime - blockTime),
+          actualFinalizationLatency:
+            finalizationTime !== undefined
+              ? existing?.actualFinalizationLatency ?? Math.max(0, finalizationTime - blockTime)
+              : existing?.actualFinalizationLatency,
+        };
+
+        if (existing?.timeoutId) {
+          clearTimeout(existing.timeoutId);
+        }
+
+        if (index >= 0) {
+          newViews[index] = nextView;
+        } else {
+          newViews.unshift(nextView);
+        }
+
+        maxView = maxView === null || view > maxView ? view : maxView;
+      }
+
+      const finalizedViews = newViews
+        .filter((viewData) => viewData.status === "finalized")
+        .sort((a, b) => b.view - a.view);
+      const activeViews = newViews
+        .filter((viewData) => viewData.status !== "finalized")
+        .sort((a, b) => b.view - a.view);
+
+      if (finalizedViews.length === 0 || activeViews.length === 0) {
+        return newViews.sort((a, b) => b.view - a.view).slice(0, 50);
+      }
+
+      return [...activeViews.slice(0, CORO_SOFT_WINDOW), ...finalizedViews.slice(0, CORO_PUBLISHED_WINDOW)]
+        .sort((a, b) => b.view - a.view);
+    });
+
+    const observedMaxView = maxView;
+    if (observedMaxView !== null) {
+      setLastObservedView((last) => (last === null || observedMaxView > last ? observedMaxView : last));
+    }
+  }, [adjustTime]);
+
+  useEffect(() => {
+    if (MODE !== 'coro' || isLoading || isInMaintenance) return;
+
+    let cancelled = false;
+    const baseUrl = `http://${BACKEND_URL}`;
+
+    const ensureWasm = async () => {
+      if (!coroWasmInitRef.current) {
+        coroWasmInitRef.current = init().then(() => undefined);
+      }
+      await coroWasmInitRef.current;
+    };
+
+    const fetchWithTimeout = async (path: string): Promise<Response> => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), CORO_REQUEST_TIMEOUT);
+      try {
+        return await fetch(`${baseUrl}${path}`, {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+
+    const fetchJson = async <T,>(path: string): Promise<T | null> => {
+      const response = await fetchWithTimeout(path);
+      if (response.status === 404) return null;
+      if (!response.ok) throw new Error(`${path} returned ${response.status}`);
+      return response.json();
+    };
+
+    const poll = async () => {
+      if (coroPollInFlightRef.current) return;
+      coroPollInFlightRef.current = true;
+
+      try {
+        await ensureWasm();
+        const archived = await fetchJson<{ head: number | null }>("/archived-head");
+        const published = await fetchJson<{ head: number | null }>("/head");
+        if (cancelled || archived?.head === null || archived?.head === undefined) return;
+
+        if (coroLastArchivedHeadRef.current !== null && archived.head < coroLastArchivedHeadRef.current) {
+          coroBlockCacheRef.current.clear();
+          coroStatusCacheRef.current.clear();
+          setViews([]);
+          setLastObservedView(null);
+        }
+        coroLastArchivedHeadRef.current = archived.head;
+
+        const sequences = new Set<number>();
+        const addRange = (head: number, size: number) => {
+          const start = Math.max(0, head - size + 1);
+          for (let sequence = start; sequence <= head; sequence++) {
+            sequences.add(sequence);
+          }
+        };
+
+        addRange(archived.head, CORO_SOFT_WINDOW);
+        if (published?.head !== null && published?.head !== undefined) {
+          addRange(published.head, CORO_PUBLISHED_WINDOW);
+        }
+
+        const fetchSequence = async (sequence: number): Promise<{ block: BlockJs; status: "archived" | "published" } | null> => {
+          if (cancelled) return null;
+
+          let status = coroStatusCacheRef.current.get(sequence);
+          if (status !== "published") {
+            const statusResponse = await fetchJson<{ status: "archived" } | { status: "published"; cursor: unknown }>(`/status/${sequence}`);
+            if (!statusResponse) return null;
+            status = statusResponse.status === "published" ? "published" : "archived";
+            coroStatusCacheRef.current.set(sequence, status);
+          }
+
+          let block = coroBlockCacheRef.current.get(sequence);
+          if (!block) {
+            const payloadResponse = await fetchWithTimeout(`/payload/${sequence}`);
+            if (!payloadResponse.ok) return null;
+            const payload = new Uint8Array(await payloadResponse.arrayBuffer());
+            block = parse_block(payload) as BlockJs | undefined;
+            if (block) {
+              coroBlockCacheRef.current.set(sequence, block);
+            }
+          }
+          if (!block) return null;
+
+          return { block, status };
+        };
+
+        const records: Array<{ block: BlockJs; status: "archived" | "published" }> = [];
+        const orderedSequences = Array.from(sequences).sort((a, b) => b - a);
+        for (let index = 0; index < orderedSequences.length; index += CORO_FETCH_CONCURRENCY) {
+          if (cancelled) return;
+          const chunk = orderedSequences.slice(index, index + CORO_FETCH_CONCURRENCY);
+          const chunkRecords = await Promise.all(chunk.map(fetchSequence));
+          for (const record of chunkRecords) {
+            if (record) {
+              records.push(record);
+            }
+          }
+        }
+        upsertCoroBlocks(records);
+
+        const lowestTracked = Math.max(
+          0,
+          Math.min(
+            archived.head - CORO_SOFT_WINDOW + 1,
+            published?.head !== null && published?.head !== undefined
+              ? published.head - CORO_PUBLISHED_WINDOW + 1
+              : archived.head,
+          ),
+        );
+        for (const sequence of Array.from(coroBlockCacheRef.current.keys())) {
+          if (sequence < lowestTracked) {
+            coroBlockCacheRef.current.delete(sequence);
+            coroStatusCacheRef.current.delete(sequence);
+          }
+        }
+
+        setErrorMessage("");
+        setShowError(false);
+      } catch (error) {
+        console.error("Coro poll failed:", error);
+        setErrorMessage("Unable to poll alto-coro history server.");
+        setShowError(true);
+      } finally {
+        coroPollInFlightRef.current = false;
+      }
+    };
+
+    poll();
+    const interval = setInterval(poll, CORO_POLL_INTERVAL);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [BACKEND_URL, isLoading, isInMaintenance, upsertCoroBlocks]);
+
   // WebSocket connection management with fixed single-connection approach
   useEffect(() => {
+    if (MODE === 'coro') return;
+
     // If loading, don't start
     if (isLoading) return;
 
@@ -736,6 +958,13 @@ const App: React.FC = () => {
     return <MaintenancePage />;
   }
 
+  const softViews = MODE === 'coro'
+    ? views.filter((viewData) => viewData.status !== "finalized").sort((a, b) => b.view - a.view)
+    : [];
+  const publishedViews = MODE === 'coro'
+    ? views.filter((viewData) => viewData.status === "finalized").sort((a, b) => b.view - a.view)
+    : [];
+
   return (
     <div className="app-container">
       <ErrorNotification
@@ -855,20 +1084,47 @@ const App: React.FC = () => {
             <h2 className="bars-title">Timeline</h2>
             <div className="legend-container">
               <LegendItem color={"#0000eeff"} label="Seeded" />
-              <LegendItem color={"#000"} label="Locked" />
-              <LegendItem color={"#228B22ff"} label="Finalized" />
+              <LegendItem color={"#000"} label={MODE === 'coro' ? "Soft" : "Locked"} />
+              <LegendItem color={"#228B22ff"} label={MODE === 'coro' ? "Published" : "Finalized"} />
             </div>
           </div>
 
-          <div className="bars-list">
-            {views.slice(0, 50).map((viewData) => (
-              <Bar
-                key={viewData.view}
-                viewData={viewData}
-                currentTime={currentTimeRef.current}
-                isMobile={isMobile}
-              />
-            ))}
+          <div className={`bars-list ${MODE === 'coro' ? 'coro-bars-grid' : ''}`}>
+            {MODE === 'coro' ? (
+              <>
+                <div className="coro-bars-column">
+                  <div className="bars-section-label">Soft head</div>
+                  {softViews.map((viewData) => (
+                    <Bar
+                      key={viewData.view}
+                      viewData={viewData}
+                      currentTime={currentTimeRef.current}
+                      isMobile={isMobile}
+                    />
+                  ))}
+                </div>
+                <div className="coro-bars-column">
+                  <div className="bars-section-label">Published on Celestia</div>
+                  {publishedViews.map((viewData) => (
+                    <Bar
+                      key={viewData.view}
+                      viewData={viewData}
+                      currentTime={currentTimeRef.current}
+                      isMobile={isMobile}
+                    />
+                  ))}
+                </div>
+              </>
+            ) : (
+              views.slice(0, 50).map((viewData) => (
+                <Bar
+                  key={viewData.view}
+                  viewData={viewData}
+                  currentTime={currentTimeRef.current}
+                  isMobile={isMobile}
+                />
+              ))
+            )}
           </div>
         </div>
       </main >
@@ -1047,6 +1303,15 @@ const Bar: React.FC<BarProps> = ({ viewData, currentTime, isMobile }) => {
   } else if (status === "timed_out") {
     // Timed out - always full width
     totalWidth = measuredWidth;
+  }
+
+  if (MODE === 'coro' && status === "notarized") {
+    totalWidth = measuredWidth;
+  } else if (MODE === 'coro' && status === "finalized") {
+    const publishedMarkerWidth = Math.max(4, minSegmentWidth / 2);
+    totalWidth = measuredWidth;
+    notarizedWidth = Math.max(0, measuredWidth - publishedMarkerWidth);
+    finalizedWidth = publishedMarkerWidth;
   }
 
   // Ensure total width doesn't exceed available space
