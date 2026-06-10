@@ -1,0 +1,23 @@
+storage_dir: local/alto-coro-replica
+partition_prefix: alto-coro-replica
+sequencer_url: http://127.0.0.1:8081
+log_level: info
+sync_interval_ms: 1000
+
+celestia:
+  # Must match the sequencer.
+  env_file: .env
+  rpc_url_env: CELESTIA_RPC_URL
+  grpc_url_env: CELESTIA_GRPC_URL
+  private_key_env: CELESTIA_PRIVATE_KEY_HEX
+  namespace: 0000008e5f679bf7116c
+
+batch:
+  max_txs: 1
+  max_payload_bytes: 1048576
+  max_tx_bytes: 64
+  max_metadata_bytes: 128
+  max_output_bytes: 128
+  max_delay_ms: 1000
+  readback_timeout_ms: 60000
+  read_timeout_ms: 60000

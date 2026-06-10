@@ -1,0 +1,24 @@
+storage_dir: local/alto-coro-sequencer
+partition_prefix: alto-coro-sequencer
+history_listen: 127.0.0.1:8081
+log_level: info
+block_time_ms: 6000
+serve_payloads: true
+
+celestia:
+  env_file: .env
+  rpc_url_env: CELESTIA_RPC_URL
+  grpc_url_env: CELESTIA_GRPC_URL
+  private_key_env: CELESTIA_PRIVATE_KEY_HEX
+  # 10-byte namespace suffix. Replace with your own random value for a real run.
+  namespace: 0000008e5f679bf7116c
+
+batch:
+  max_txs: 1
+  max_payload_bytes: 1048576
+  max_tx_bytes: 64
+  max_metadata_bytes: 128
+  max_output_bytes: 128
+  max_delay_ms: 1000
+  readback_timeout_ms: 60000
+  read_timeout_ms: 60000

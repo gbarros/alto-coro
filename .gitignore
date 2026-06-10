@@ -5,3 +5,5 @@ target
 /assets
 /test
 /types/pkg
+/local
+.env

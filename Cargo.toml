@@ -8,6 +8,7 @@ members = [
     "indexer",
     "types",
     "validator",
+    "alto-coro",
 ]
 resolver = "2"
 
@@ -20,6 +21,8 @@ license = "MIT OR Apache-2.0"
 alto-chain = { version = "2026.5.0", path = "chain" }
 alto-client = { version = "2026.5.0", path = "client" }
 alto-types = { version = "2026.5.0", path = "types" }
+coro = { git = "ssh://git@github.com/celestiaorg/coro.git", rev = "665b7447710d4a1eaa12dc4e243592579746fe8d", package = "coro" }
+coro-demo = { git = "ssh://git@github.com/celestiaorg/coro.git", rev = "665b7447710d4a1eaa12dc4e243592579746fe8d", package = "coro-demo" }
 commonware-actor = "2026.5.0"
 commonware-broadcast = "2026.5.0"
 commonware-codec = "2026.5.0"
@@ -54,6 +57,10 @@ tower = "0.5.2"
 tower-http = "0.6.2"
 reqwest = { version = "0.12.12", default-features = false }
 tokio-tungstenite = "0.28.0"
+async-trait = "0.1"
+celestia-client = "1.0.0"
+celestia-grpc = "1.0.0"
+serde_yaml = "0.9.34"
 
 [profile.bench]
 # Because we enable overflow checks in "release," we should benchmark with them.
