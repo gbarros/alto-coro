@@ -7,8 +7,9 @@ and Celestia blob publication.
 The demo path is intentionally small:
 
 - one sequencer builds simple `alto_types::Block` payloads,
-- soft-confirmed blocks are held in memory and served immediately,
-- the soft path batches encoded blocks as Celestia blobs in the background,
+- Alto blocks are submitted into Coro one at a time,
+- Coro's batch policy archives pending Alto blocks as local soft confirmations,
+- each archived Coro batch is published as one Celestia blob in the background,
 - the sequencer serves Coro history over HTTP,
 - one or more replicas follow that history and verify Alto block continuity.
 
@@ -19,9 +20,11 @@ for quickly testing Alto-shaped blocks on Celestia Mocha.
 
 ```text
 alto-coro sequencer
-  -> builds Alto block
-  -> stores in-memory soft-confirmation archive
-  -> commits rolling batches of blobs to Celestia in the background
+  -> builds Alto blocks at the configured block time
+  -> submits encoded Alto blocks into Coro
+  -> lets Coro cut local batches by BatchPolicy
+  -> publishes each archived Coro batch as one Celestia blob
+  -> records Celestia cursors back into Coro
   -> serves Coro history and raw Alto block compatibility endpoints
 
 alto-coro replica
@@ -31,7 +34,10 @@ alto-coro replica
 ```
 
 By default `/head` is the canonical published head. `/archived-head` exposes
-the soft-confirmed head, which can run ahead of Celestia publication.
+the soft-confirmed Coro batch head, which can run ahead of Celestia
+publication. The explorer uses block-oriented compatibility endpoints:
+`/block-head`, `/published-block-head`, `/block-status/<height>`, and
+`/block/<height>`.
 
 The history server also exposes the subset of the original Alto indexer API
 that can be answered honestly in this PoC:
@@ -109,12 +115,18 @@ confirmation_mode: soft
 block_time_ms: 500
 publish_queue: 1024
 publish_concurrency: 8
-publish_batch_max_blocks: 4
-publish_batch_max_delay_ms: 1500
+batch:
+  max_txs: 1024
+  max_tx_bytes: 4096
+  max_delay_ms: 1500
 ```
 
 Set `confirmation_mode: canonical` to restore the older behavior where each
 block waits for Celestia publication/readback before the next block is produced.
+
+This branch is pinned to Coro commit
+`2c195362884d146c8eea79cb16a2290237c7e4f8`, which includes the
+archive/publish split used by this PoC.
 
 ## Generate a Mocha Account
 
@@ -139,8 +151,9 @@ cargo run -p alto-coro -- run alto-coro/examples/sequencer-mocha.yaml
 The sequencer listens on `127.0.0.1:8081` by default and logs each successful
 publication with:
 
-- Alto sequence,
-- Alto height,
+- Coro sequence,
+- first and last Alto height in the Coro batch,
+- Alto block count,
 - Celestia height,
 - namespace,
 - blob commitment.
@@ -152,15 +165,22 @@ block_time_ms: 500
 ```
 
 In `soft` mode, block production is no longer gated by Celestia block time until
-the background publication queue fills. Soft publication uses a rolling Celestia
-batch window: it collects pending Alto blocks until either
-`publish_batch_max_blocks` is reached or `publish_batch_max_delay_ms` elapses,
-then submits those blocks as separate blobs in one PFB transaction. The default
-settings target roughly 4 Alto blocks per Mocha block at a 500ms soft interval
-while keeping the oldest-block batch wait below the expected Mocha block time.
-`publish_concurrency` controls how many batch transactions can be waiting for
-Celestia commit at once. Canonical publication still depends on Celestia
-submit/readback latency.
+Coro's batch policy controls local soft confirmation:
+
+```yaml
+batch:
+  max_txs: 1024
+  max_tx_bytes: 4096
+  max_delay_ms: 1500
+```
+
+`max_delay_ms` is the normal batching trigger. With a 500ms Alto block interval
+and a 1500ms Coro delay, a Coro batch should usually contain about three Alto
+blocks. `max_txs` is intentionally high so it behaves as a safety cap rather
+than the usual batch trigger. `max_tx_bytes` must fit one encoded Alto block.
+Each Coro batch is submitted as one Celestia blob, and `publish_concurrency`
+controls how many Coro batch submissions can be waiting for Celestia commit at
+once. Canonical publication still depends on Celestia submit/readback latency.
 
 Publication logs include:
 
@@ -172,28 +192,26 @@ Publication logs include:
 - `commit_latency_ms`: backend-observed time spent broadcasting and waiting for
   Celestia commit.
 
-The history `GET /status/<sequence>` response also includes backend timing in
-soft mode:
+The block compatibility `GET /block-status/<height>` response includes backend
+timing in soft mode:
 
-- `soft.soft_latency_ms`: block timestamp to local soft archive insert,
-- `commit.batch_wait_ms`: local soft confirmation until the batch publisher
-  starts broadcasting the PFB transaction,
+- `soft.soft_latency_ms`: Alto block timestamp to Coro local archive insert,
+- `commit.batch_wait_ms`: local soft confirmation until the publisher starts
+  broadcasting the PFB transaction,
 - `commit.soft_to_pfb_broadcast_ms`: local soft confirmation until PFB
   broadcast acceptance, which is the explorer's Coro `Submit Delay` metric,
 - `commit.publish_latency_ms`: block timestamp to Mocha block timestamp,
 - `commit.backend_commit_latency_ms`: block timestamp to backend-observed commit
   response, used as a fallback if the Mocha header timestamp is unavailable.
 
-In this temporary soft path, `soft.soft_latency_ms` is expected to be very low
-because block construction and local archive insertion happen in the same loop.
-`Submit Delay` is the more useful tuning metric until the default path moves to
-Coro-owned durable archived batches.
+In this soft path, `soft.soft_latency_ms` includes the time an Alto block spends
+waiting inside Coro's batch policy before archive. `Submit Delay` should be low
+because it starts after Coro has already cut the local soft-confirmed batch.
 
-Current `soft` mode is ephemeral demo mode. Its soft and published history are
-kept in memory, so a sequencer restart forgets that history and starts again
-from sequence `0`. For clean demo runs after restarting the sequencer, restart
-replicas with fresh local storage too. Durable restart semantics belong to the
-future Coro-owned archive/publish split.
+Coro now owns the local archived/published sequence state in soft mode. The
+explorer timing sidecar remains in memory, so detailed timing fields are only
+available for batches observed during the current process run. This is still a
+single-writer local-store PoC, not a multi-validator Alto network.
 
 ## Run a Replica
 
@@ -236,15 +254,20 @@ Open `http://localhost:3000`.
 Coro mode keeps the original explorer for the pieces that still match Alto
 blocks, but changes the live feed semantics:
 
-- **Soft** means the block is in the sequencer's local archive.
+- **Soft** means Coro has archived a local batch containing the block.
 - **Published** means the block's blob transaction is committed on Celestia and
   the sequencer has a height, namespace, and commitment for it. The soft path no
   longer waits for blob readback before reporting this state.
 
-In Coro mode the explorer uses backend-provided timings. `Submit Delay` is the
-time from local soft confirmation until PFB broadcast acceptance. Publish
+In Coro mode the explorer uses backend-provided timings. `Submit Delay` starts
+after Coro local soft confirmation and ends at PFB broadcast acceptance. Publish
 latency prefers the Mocha block timestamp metric (`commit.publish_latency_ms`)
 rather than the browser's polling time.
+
+The block compatibility API only reports a block as `Published` when both the
+Coro cursor and the demo timing sidecar are available. Coro's durable batch
+status remains the source of truth for replicas, but the explorer avoids using a
+published sample until it has complete backend timing.
 
 It does not display Simplex seeds, notarizations, or finalizations because this
 PoC does not produce those artifacts.
@@ -252,6 +275,13 @@ PoC does not produce those artifacts.
 ## Reset Local State
 
 Fresh storage is recommended between incompatible config or code changes:
+
+```sh
+rm -rf local/alto-coro-batched-sequencer local/alto-coro-batched-replica
+```
+
+If you previously ran an older one-block-per-Coro-sequence build and see decode
+errors at startup, remove the old local stores too:
 
 ```sh
 rm -rf local/alto-coro-sequencer local/alto-coro-replica

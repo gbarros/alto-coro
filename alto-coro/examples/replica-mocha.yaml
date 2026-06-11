@@ -1,5 +1,5 @@
-storage_dir: local/alto-coro-replica
-partition_prefix: alto-coro-replica
+storage_dir: local/alto-coro-batched-replica
+partition_prefix: alto-coro-batched-replica
 sequencer_url: http://127.0.0.1:8081
 log_level: info
 sync_interval_ms: 1000
@@ -11,11 +11,11 @@ celestia:
   namespace: 0000008e5f679bf7116c
 
 batch:
-  max_txs: 1
+  max_txs: 1024
   max_payload_bytes: 1048576
-  max_tx_bytes: 64
+  max_tx_bytes: 4096
   max_metadata_bytes: 128
   max_output_bytes: 128
-  max_delay_ms: 1000
+  max_delay_ms: 1500
   readback_timeout_ms: 60000
   read_timeout_ms: 60000
