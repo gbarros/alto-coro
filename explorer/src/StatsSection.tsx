@@ -157,11 +157,11 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
     const notarizationTimes = views
         .filter(view => (view.status === "notarized" || view.status === "finalized"))
         .map(view => {
-            if (view.actualNotarizationLatency !== undefined && view.actualNotarizationLatency > 0) {
+            if (view.actualNotarizationLatency !== undefined && view.actualNotarizationLatency >= 0) {
                 return view.actualNotarizationLatency;
             } else if (view.notarizationTime && view.startTime) {
                 const calculatedLatency = view.notarizationTime - view.startTime;
-                return calculatedLatency > 0 ? calculatedLatency : null;
+                return calculatedLatency >= 0 ? calculatedLatency : null;
             }
             return null;
         })
@@ -170,11 +170,11 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
     const finalizationTimes = views
         .filter(view => view.status === "finalized")
         .map(view => {
-            if (view.actualFinalizationLatency !== undefined && view.actualFinalizationLatency > 0) {
+            if (view.actualFinalizationLatency !== undefined && view.actualFinalizationLatency >= 0) {
                 return view.actualFinalizationLatency;
             } else if (view.finalizationTime && view.startTime) {
                 const calculatedLatency = view.finalizationTime - view.startTime;
-                return calculatedLatency > 0 ? calculatedLatency : null;
+                return calculatedLatency >= 0 ? calculatedLatency : null;
             }
             return null;
         })
@@ -238,7 +238,7 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
                         sortedBlockTimes[sortedBlockTimes.length / 2]) /
                     2
                 )
-            : 0;
+            : null;
 
     const sortedNotarizationTimes = [...notarizationTimes].sort((a, b) => a - b);
     const medianTimeToLock =
@@ -250,7 +250,7 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
                         sortedNotarizationTimes[sortedNotarizationTimes.length / 2]) /
                     2
                 )
-            : 0;
+            : null;
 
     const sortedFinalizationTimes = [...finalizationTimes].sort((a, b) => a - b);
     const medianTimeToFinalize =
@@ -262,7 +262,7 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
                         sortedFinalizationTimes[sortedFinalizationTimes.length / 2]) /
                     2
                 )
-            : 0;
+            : null;
 
     const isCoro = MODE === 'coro';
     const tooltips = {
@@ -270,7 +270,7 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
             ? "The median difference between consecutive Alto block timestamps produced by the local Coro sequencer. This follows alto-coro block_time_ms, not Celestia block time."
             : "The median difference between consecutive block timestamps.<br><br><i>This is functionally equivalent to the average validator's time to lock (unlike your browser, validators are connected directly to each other instead of an intermediary streaming layer).</i>",
         timeToLock: isCoro
-            ? "The median backend latency from local soft confirmation to PFB broadcast acceptance. This captures the rolling batch window plus submit RPC, not Celestia inclusion."
+            ? "The median backend latency from Coro local archive to PFB broadcast acceptance. Coro's batch.max_delay_ms is counted in Soft, not Submit Delay."
             : "The median latency from block proposal to receiving 2f+1 votes, as observed by your browser.<br><br><i>Locked blocks must be included in the canonical chain if the view is not nullified.</i>",
         timeToFinalize: isCoro
             ? "The median latency from Alto block timestamp to the Mocha block timestamp that committed the PFB transaction. If the Mocha header timestamp is temporarily unavailable, the backend falls back to its own committed-at observation."
@@ -297,9 +297,9 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
                     <div className="source-label">CLUSTER</div>
                     <Tooltip content={tooltips.blockTime}>
                         <div className="metric-container">
-                            <div className="stat-label">{isCoro ? "Soft Interval" : "Block Time"}</div>
+                            <div className="stat-label">Block Time</div>
                             <div className="stat-value">
-                                {medianBlockTime > 0 ? `${medianBlockTime}ms` : "N/A"}
+                                {medianBlockTime !== null ? `${medianBlockTime}ms` : "N/A"}
                             </div>
                         </div>
                     </Tooltip>
@@ -312,7 +312,7 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
                             <Tooltip content={tooltips.timeToLock}>
                                 <div className="stat-label">{isCoro ? "Submit Delay" : "Locked"}</div>
                                 <div className="stat-value">
-                                    {medianTimeToLock > 0 ? `${medianTimeToLock}ms` : "N/A"}
+                                    {medianTimeToLock !== null ? `${medianTimeToLock}ms` : "N/A"}
                                 </div>
                             </Tooltip>
                         </div>
@@ -321,7 +321,7 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
                             <Tooltip content={tooltips.timeToFinalize}>
                                 <div className="stat-label">{isCoro ? "Publish Latency" : "Finalized"}</div>
                                 <div className="stat-value">
-                                    {medianTimeToFinalize > 0 ? `${medianTimeToFinalize}ms` : "N/A"}
+                                    {medianTimeToFinalize !== null ? `${medianTimeToFinalize}ms` : "N/A"}
                                 </div>
                             </Tooltip>
                         </div>

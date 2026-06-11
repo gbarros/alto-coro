@@ -1,28 +1,41 @@
-# alto
+# alto-coro
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE-MIT)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE-APACHE)
-[![Codecov](https://codecov.io/gh/commonwarexyz/alto/graph/badge.svg?token=Y2A6Q5G25W)](https://codecov.io/gh/commonwarexyz/alto)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/commonwarexyz/alto)
+`alto-coro` is a fork of Commonware's `alto` demo that experiments with a
+Celestia-backed sequencing path.
 
-## Components
+The original Alto codebase is a minimal blockchain demo built on the Commonware
+stack. This fork keeps the Alto block shape and explorer experience, but adds a
+small proof-of-concept path where:
 
-_Components are designed for deployment in adversarial environments. If you find an exploit, please refer to our [security policy](./SECURITY.md) before disclosing it publicly (an exploit may equip a malicious party to attack users of a primitive)._
+- Alto blocks are produced by a single local sequencer,
+- blocks are submitted into [Coro](https://github.com/celestiaorg/coro),
+- Coro locally archives batches for soft confirmation,
+- archived batches are published to Celestia as blobs,
+- replicas follow Coro history and verify Alto block continuity.
 
-* [chain](./chain/README.md): A minimal (and wicked fast) blockchain built with the [Commonware Library](https://github.com/commonwarexyz/monorepo).
-* [client](./client/README.md): Interact with an `alto` indexer.
-* [deploy](./deploy/README.md): Deploy an instance of `alto`.
-* [explorer](./explorer/README.md): Visualize `alto` activity.
-* [follower](./follower/README.md): Run a follower node for `alto`.
-* [indexer](./indexer/README.md): Serve `alto` activity.
-* [inspector](./inspector/README.md): Inspect `alto` activity.
-* [types](./types/README.md): Common types used throughout `alto`.
-* [validator](./validator/README.md): Run a validator node for `alto`.
+This is intentionally not a full Alto validator network. It is a focused PoC for
+testing Alto-shaped block production over Coro and Celestia DA, currently aimed
+at Mocha demo runs.
+
+For architecture, configuration, Mocha setup, replica usage, and explorer notes,
+see [alto-coro/README.md](./alto-coro/README.md).
+
+## Repository Layout
+
+- [alto-coro](./alto-coro/README.md): Coro/Celestia sequencer and replica PoC.
+- [explorer](./explorer/README.md): Alto explorer with a Coro mode.
+- [types](./types/README.md): Shared Alto block types used by the PoC.
+- `chain`, `client`, `deploy`, `follower`, `indexer`, `inspector`, and
+  `validator`: original Alto components retained from the upstream fork.
+
+## Dependency Note
+
+This branch is pinned to Coro commit
+`2c195362884d146c8eea79cb16a2290237c7e4f8`, which includes the
+archive/publish split used by the PoC.
 
 ## Licensing
 
-This repository is dual-licensed under both the [Apache 2.0](./LICENSE-APACHE) and [MIT](./LICENSE-MIT) licenses. You may choose either license when employing this code.
-
-## Support
-
-If you have any questions about `alto`, we encourage you to post in [GitHub Discussions](https://github.com/commonwarexyz/monorepo/discussions). We're happy to help!
+This repository preserves Alto's dual license under both the
+[Apache 2.0](./LICENSE-APACHE) and [MIT](./LICENSE-MIT) licenses. You may choose
+either license when employing this code.

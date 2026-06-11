@@ -86,14 +86,15 @@ Coro mode is used with the `alto-coro` sequencer. It does not expect Alto
 Simplex seed, notarization, or finalization certificates. Instead, it polls the
 Coro history server:
 
-- `GET /archived-head` for the soft-confirmed head,
-- `GET /status/<sequence>` for soft vs published status,
-- `GET /payload/<sequence>` for encoded `alto_types::Block` payloads,
+- `GET /block-head` for the soft-confirmed Alto block head,
+- `GET /published-block-head` for the Celestia-published Alto block head,
+- `GET /block-status/<height>` for soft vs published status,
+- `GET /block/<height>` for encoded `alto_types::Block` payloads,
 - `GET /block/latest` or `GET /block/<height>` for search compatibility.
 
 The timeline labels are adapted accordingly:
 
-- **Soft** means the sequencer has built and archived the block locally.
+- **Soft** means Coro has archived a local batch containing the block.
 - **Published** means Coro has a Celestia blob reference for that block.
 
 Populate `src/coro_config.ts`:

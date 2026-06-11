@@ -1714,7 +1714,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "coro"
 version = "0.1.0"
-source = "git+ssh://git@github.com/celestiaorg/coro.git?rev=665b7447710d4a1eaa12dc4e243592579746fe8d#665b7447710d4a1eaa12dc4e243592579746fe8d"
+source = "git+ssh://git@github.com/celestiaorg/coro.git?rev=2c195362884d146c8eea79cb16a2290237c7e4f8#2c195362884d146c8eea79cb16a2290237c7e4f8"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1735,7 +1735,7 @@ dependencies = [
 [[package]]
 name = "coro-demo"
 version = "0.1.0"
-source = "git+ssh://git@github.com/celestiaorg/coro.git?rev=665b7447710d4a1eaa12dc4e243592579746fe8d#665b7447710d4a1eaa12dc4e243592579746fe8d"
+source = "git+ssh://git@github.com/celestiaorg/coro.git?rev=2c195362884d146c8eea79cb16a2290237c7e4f8#2c195362884d146c8eea79cb16a2290237c7e4f8"
 dependencies = [
  "async-trait",
  "axum 0.7.9",

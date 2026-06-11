@@ -1,13 +1,11 @@
-storage_dir: local/alto-coro-sequencer
-partition_prefix: alto-coro-sequencer
+storage_dir: local/alto-coro-batched-sequencer
+partition_prefix: alto-coro-batched-sequencer
 history_listen: 127.0.0.1:8081
 log_level: info
 confirmation_mode: soft
 block_time_ms: 500
 publish_queue: 1024
 publish_concurrency: 8
-publish_batch_max_blocks: 4
-publish_batch_max_delay_ms: 1500
 serve_payloads: true
 
 celestia:
@@ -19,11 +17,11 @@ celestia:
   namespace: 0000008e5f679bf7116c
 
 batch:
-  max_txs: 1
+  max_txs: 1024
   max_payload_bytes: 1048576
-  max_tx_bytes: 64
+  max_tx_bytes: 4096
   max_metadata_bytes: 128
   max_output_bytes: 128
-  max_delay_ms: 1000
+  max_delay_ms: 1500
   readback_timeout_ms: 60000
   read_timeout_ms: 60000

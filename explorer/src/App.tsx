@@ -655,7 +655,12 @@ const App: React.FC = () => {
           publishLatencyMs ?? existing?.actualFinalizationLatency;
         const finalizationTime =
           nextStatus === "finalized"
-            ? existing?.finalizationTime ?? (finalizationLatency !== undefined ? blockTime + finalizationLatency : currentTime)
+            ? existing?.finalizationTime ??
+              (finalizationLatency !== undefined
+                ? blockTime + finalizationLatency
+                : MODE === "coro"
+                  ? undefined
+                  : currentTime)
             : existing?.finalizationTime;
 
         const nextView: ViewData = {
@@ -672,7 +677,8 @@ const App: React.FC = () => {
             finalizationLatency !== undefined
               ? finalizationLatency
               : finalizationTime !== undefined
-                ? existing?.actualFinalizationLatency ?? Math.max(0, finalizationTime - blockTime)
+                ? existing?.actualFinalizationLatency ??
+                  (MODE === "coro" ? undefined : Math.max(0, finalizationTime - blockTime))
               : existing?.actualFinalizationLatency,
         };
 
@@ -749,8 +755,8 @@ const App: React.FC = () => {
 
       try {
         await ensureWasm();
-        const archived = await fetchJson<{ head: number | null }>("/archived-head");
-        const published = await fetchJson<{ head: number | null }>("/head");
+        const archived = await fetchJson<{ head: number | null }>("/block-head");
+        const published = await fetchJson<{ head: number | null }>("/published-block-head");
         if (cancelled || archived?.head === null || archived?.head === undefined) return;
 
         if (coroLastArchivedHeadRef.current !== null && archived.head < coroLastArchivedHeadRef.current) {
@@ -774,24 +780,27 @@ const App: React.FC = () => {
           addRange(published.head, CORO_PUBLISHED_WINDOW);
         }
 
-        const fetchSequence = async (sequence: number): Promise<CoroBlockRecord | null> => {
+        const fetchBlock = async (height: number): Promise<CoroBlockRecord | null> => {
           if (cancelled) return null;
 
-          let statusResponse: CoroStatusResponse | null | undefined = coroStatusCacheRef.current.get(sequence);
-          if (statusResponse?.status !== "published") {
-            statusResponse = await fetchJson<CoroStatusResponse>(`/status/${sequence}`);
+          let statusResponse: CoroStatusResponse | null | undefined = coroStatusCacheRef.current.get(height);
+          if (
+            statusResponse?.status !== "published" ||
+            (statusResponse.status === "published" && !statusResponse.commit)
+          ) {
+            statusResponse = await fetchJson<CoroStatusResponse>(`/block-status/${height}`);
             if (!statusResponse) return null;
-            coroStatusCacheRef.current.set(sequence, statusResponse);
+            coroStatusCacheRef.current.set(height, statusResponse);
           }
 
-          let block = coroBlockCacheRef.current.get(sequence);
+          let block = coroBlockCacheRef.current.get(height);
           if (!block) {
-            const payloadResponse = await fetchWithTimeout(`/payload/${sequence}`);
+            const payloadResponse = await fetchWithTimeout(`/block/${height}`);
             if (!payloadResponse.ok) return null;
             const payload = new Uint8Array(await payloadResponse.arrayBuffer());
             block = parse_block(payload) as BlockJs | undefined;
             if (block) {
-              coroBlockCacheRef.current.set(sequence, block);
+              coroBlockCacheRef.current.set(height, block);
             }
           }
           if (!block) return null;
@@ -811,11 +820,11 @@ const App: React.FC = () => {
         };
 
         const records: CoroBlockRecord[] = [];
-        const orderedSequences = Array.from(sequences).sort((a, b) => b - a);
-        for (let index = 0; index < orderedSequences.length; index += CORO_FETCH_CONCURRENCY) {
+        const orderedHeights = Array.from(sequences).sort((a, b) => b - a);
+        for (let index = 0; index < orderedHeights.length; index += CORO_FETCH_CONCURRENCY) {
           if (cancelled) return;
-          const chunk = orderedSequences.slice(index, index + CORO_FETCH_CONCURRENCY);
-          const chunkRecords = await Promise.all(chunk.map(fetchSequence));
+          const chunk = orderedHeights.slice(index, index + CORO_FETCH_CONCURRENCY);
+          const chunkRecords = await Promise.all(chunk.map(fetchBlock));
           for (const record of chunkRecords) {
             if (record) {
               records.push(record);
