@@ -3,7 +3,7 @@ use bytes::Bytes;
 use celestia_client::tx::TxConfig;
 use celestia_client::types::{nmt::Namespace, Blob as CelestiaBlob};
 use celestia_client::Client;
-use celestia_grpc::GrpcClient;
+use celestia_grpc::{Error as CelestiaGrpcError, GrpcClient, TxInfo};
 use commonware_codec::DecodeExt;
 use commonware_cryptography::{ed25519, Digestible};
 use commonware_runtime::tokio as runtime_tokio;
@@ -12,6 +12,8 @@ use coro::single_sequencer::SingleSequencer;
 use coro::{ArchivedBatch, BatchCursor, BatchNumber, BlobCommitment, BlobRef};
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -418,13 +420,21 @@ pub(crate) async fn run_soft_publish_loop(
     mut publish_rx: mpsc::Receiver<SoftBatch>,
     publish_concurrency: usize,
 ) {
+    let broadcast_concurrency = publish_concurrency.max(1);
+    let confirmation_concurrency = broadcast_concurrency.saturating_mul(4).max(1);
+    let (confirm_tx, confirm_rx) = mpsc::channel(broadcast_concurrency.saturating_mul(64).max(1));
+    let confirm_handle = tokio::spawn(run_soft_confirm_loop(confirm_rx, confirmation_concurrency));
+
     let mut in_flight = JoinSet::new();
-    info!(publish_concurrency, "soft Celestia commit pipeline started");
+    info!(
+        broadcast_concurrency,
+        confirmation_concurrency, "soft Celestia publish pipeline started"
+    );
     while let Some(batch) = publish_rx.recv().await {
-        while in_flight.len() >= publish_concurrency {
+        while in_flight.len() >= broadcast_concurrency {
             if let Some(result) = in_flight.join_next().await {
                 if let Err(error) = result {
-                    warn!(error = %error, "soft Celestia commit task failed");
+                    warn!(error = %error, "soft Celestia broadcast task failed");
                 }
             }
         }
@@ -432,23 +442,33 @@ pub(crate) async fn run_soft_publish_loop(
         let committer = committer.clone();
         let sequencer = sequencer.clone();
         let soft_status = soft_status.clone();
+        let confirm_tx = confirm_tx.clone();
         in_flight.spawn(async move {
-            publish_soft_batch(committer, sequencer, soft_status, batch).await;
+            broadcast_soft_batch(committer, sequencer, soft_status, batch, confirm_tx).await;
         });
     }
 
     while let Some(result) = in_flight.join_next().await {
         if let Err(error) = result {
-            warn!(error = %error, "soft Celestia commit task failed");
+            warn!(error = %error, "soft Celestia broadcast task failed");
         }
+    }
+    drop(confirm_tx);
+    if let Err(error) = confirm_handle.await {
+        warn!(error = %error, "soft Celestia confirmation loop failed");
     }
 }
 
-async fn publish_soft_batch(
+type ConfirmFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type ConfirmTxFuture =
+    Pin<Box<dyn Future<Output = Result<TxInfo, CelestiaGrpcError>> + Send + 'static>>;
+
+async fn broadcast_soft_batch(
     committer: SoftCelestiaCommitter,
     sequencer: Arc<AltoSequencer>,
     soft_status: Arc<SoftStatusIndex>,
     batch: SoftBatch,
+    confirm_tx: mpsc::Sender<ConfirmFuture>,
 ) {
     let sequence = batch.sequence;
     let (blob, commitment) = match celestia_blob_for_soft_batch(&committer, &batch) {
@@ -464,7 +484,7 @@ async fn publish_soft_batch(
     };
 
     loop {
-        let started_at = now_millis();
+        let broadcast_started_at = now_millis();
         let submitted = match committer
             .grpc
             .broadcast_blobs(&[blob.clone()], committer.tx_config.clone())
@@ -484,7 +504,75 @@ async fn publish_soft_batch(
         let broadcasted_at = now_millis();
         let tx_hash = hex(submitted.tx_ref().hash.as_bytes());
 
-        match submitted.confirm().await {
+        let confirm_future: ConfirmFuture = Box::pin(confirm_soft_batch(
+            committer,
+            sequencer,
+            soft_status,
+            batch,
+            blob,
+            commitment,
+            Box::pin(submitted.confirm()),
+            broadcast_started_at,
+            broadcasted_at,
+            tx_hash,
+        ));
+        if confirm_tx.send(confirm_future).await.is_err() {
+            warn!(sequence = sequence.0, "soft confirmation queue closed");
+        }
+        return;
+    }
+}
+
+async fn run_soft_confirm_loop(
+    mut confirm_rx: mpsc::Receiver<ConfirmFuture>,
+    confirmation_concurrency: usize,
+) {
+    let mut in_flight = JoinSet::new();
+    while let Some(confirm_future) = confirm_rx.recv().await {
+        while in_flight.len() >= confirmation_concurrency {
+            if let Some(result) = in_flight.join_next().await {
+                if let Err(error) = result {
+                    warn!(error = %error, "soft Celestia confirmation task failed");
+                }
+            }
+        }
+
+        in_flight.spawn(confirm_future);
+    }
+
+    while let Some(result) = in_flight.join_next().await {
+        if let Err(error) = result {
+            warn!(error = %error, "soft Celestia confirmation task failed");
+        }
+    }
+}
+
+async fn confirm_soft_batch(
+    committer: SoftCelestiaCommitter,
+    sequencer: Arc<AltoSequencer>,
+    soft_status: Arc<SoftStatusIndex>,
+    batch: SoftBatch,
+    blob: CelestiaBlob,
+    commitment: BlobCommitment,
+    submitted: ConfirmTxFuture,
+    broadcast_started_at: u64,
+    broadcasted_at: u64,
+    tx_hash: String,
+) {
+    let mut submitted = Some(submitted);
+    let mut broadcast_started_at = broadcast_started_at;
+    let mut broadcasted_at = broadcasted_at;
+    let mut tx_hash = tx_hash;
+    loop {
+        let sequence = batch.sequence;
+        let Some(current_submission) = submitted.take() else {
+            warn!(
+                sequence = sequence.0,
+                "soft confirmation task missing submitted tx"
+            );
+            return;
+        };
+        match current_submission.await {
             Ok(tx_info) => {
                 let committed_at = now_millis();
                 let celestia_block_time_ms = match time::timeout(
@@ -526,10 +614,12 @@ async fn publish_soft_batch(
                                 }),
                                 backend_commit_latency_ms: committed_at
                                     .saturating_sub(block.metadata.timestamp),
-                                batch_wait_ms: started_at.saturating_sub(batch.soft_confirmed_at),
+                                batch_wait_ms: broadcast_started_at
+                                    .saturating_sub(batch.soft_confirmed_at),
                                 soft_to_pfb_broadcast_ms: broadcasted_at
                                     .saturating_sub(batch.soft_confirmed_at),
-                                broadcast_latency_ms: broadcasted_at.saturating_sub(started_at),
+                                broadcast_latency_ms: broadcasted_at
+                                    .saturating_sub(broadcast_started_at),
                                 confirmation_wait_ms: committed_at.saturating_sub(broadcasted_at),
                             };
                             soft_status.publish_height(height, commit).await;
@@ -565,7 +655,8 @@ async fn publish_soft_batch(
                         newest_publish_latency_ms = ?last_latency,
                         oldest_queued_for_ms = committed_at.saturating_sub(first.metadata.timestamp),
                         newest_queued_for_ms = committed_at.saturating_sub(last.metadata.timestamp),
-                        commit_latency_ms = committed_at.saturating_sub(started_at),
+                        commit_latency_ms = committed_at.saturating_sub(broadcast_started_at),
+                        confirmation_wait_ms = committed_at.saturating_sub(broadcasted_at),
                         "committed soft-confirmed Coro batch to Celestia"
                     );
                 }
@@ -578,6 +669,30 @@ async fn publish_soft_batch(
                     "soft-confirmed Coro batch confirmation failed; retrying"
                 );
                 time::sleep(Duration::from_secs(1)).await;
+
+                loop {
+                    broadcast_started_at = now_millis();
+                    let next_submitted = match committer
+                        .grpc
+                        .broadcast_blobs(&[blob.clone()], committer.tx_config.clone())
+                        .await
+                    {
+                        Ok(submitted) => submitted,
+                        Err(error) => {
+                            warn!(
+                                sequence = sequence.0,
+                                error = %error,
+                                "soft-confirmed Coro batch rebroadcast failed; retrying"
+                            );
+                            time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    };
+                    broadcasted_at = now_millis();
+                    tx_hash = hex(next_submitted.tx_ref().hash.as_bytes());
+                    submitted = Some(Box::pin(next_submitted.confirm()));
+                    break;
+                }
             }
         }
     }

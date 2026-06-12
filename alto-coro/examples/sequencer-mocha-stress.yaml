@@ -1,0 +1,35 @@
+storage_dir: local/alto-coro-fast-sequencer
+partition_prefix: alto-coro-fast-sequencer
+history_listen: 127.0.0.1:8081
+log_level: info
+confirmation_mode: soft
+
+# Stress profile: produce Alto blocks as fast as the runtime loop reasonably allows.
+# This is intentionally not a realistic consensus cadence.
+block_time_ms: 1
+
+# Keep the publish side from becoming artificially queue-bound during short runs.
+publish_queue: 16384
+publish_concurrency: 8
+serve_payloads: true
+
+celestia:
+  env_file: .env
+  rpc_url_env: CELESTIA_RPC_URL
+  grpc_url_env: CELESTIA_GRPC_URL
+  private_key_env: CELESTIA_PRIVATE_KEY_HEX
+  # 10-byte namespace suffix. Replace with your own random value for a real run.
+  namespace: 0000008e5f679bf7116c
+
+batch:
+  # Keep max_delay_ms as the primary batching trigger, but use a shorter window
+  # than the normal demo so the explorer can observe fast production without
+  # waiting for giant 1ms-cadence batches.
+  max_txs: 1024
+  max_payload_bytes: 1048576
+  max_tx_bytes: 4096
+  max_metadata_bytes: 128
+  max_output_bytes: 128
+  max_delay_ms: 500
+  readback_timeout_ms: 60000
+  read_timeout_ms: 60000

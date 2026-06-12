@@ -152,7 +152,12 @@ const Tooltip: React.FC<TooltipProps> = ({ content, children }) => {
     );
 };
 
-const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onClusterChange, configs }) => {
+const StatsSection: React.FC<StatsSectionProps> = ({
+    views,
+    selectedCluster,
+    onClusterChange,
+    configs,
+}) => {
     // Calculation logic (unchanged from original)
     const notarizationTimes = views
         .filter(view => (view.status === "notarized" || view.status === "finalized"))
@@ -267,7 +272,7 @@ const StatsSection: React.FC<StatsSectionProps> = ({ views, selectedCluster, onC
     const isCoro = MODE === 'coro';
     const tooltips = {
         blockTime: isCoro
-            ? "The median difference between consecutive Alto block timestamps produced by the local Coro sequencer. This follows alto-coro block_time_ms, not Celestia block time."
+            ? "The median difference between consecutive Alto block timestamps observed from the local Coro sequencer. This is observed production cadence, not Celestia block time."
             : "The median difference between consecutive block timestamps.<br><br><i>This is functionally equivalent to the average validator's time to lock (unlike your browser, validators are connected directly to each other instead of an intermediary streaming layer).</i>",
         timeToLock: isCoro
             ? "The median backend latency from Coro local archive to PFB broadcast acceptance. Coro's batch.max_delay_ms is counted in Soft, not Submit Delay."

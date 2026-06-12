@@ -8,7 +8,7 @@ use axum::{
 use commonware_formatting::from_hex;
 use coro::{BatchCursor, BatchNumber};
 use coro_demo::{HistoryServerConfig, SequencerHistory};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{error::Error, net::SocketAddr, sync::Arc};
 use tower_http::cors::CorsLayer;
 use tracing::warn;
@@ -21,25 +21,30 @@ struct HistoryApiState {
     history: Arc<dyn coro_demo::SequencerHistory>,
     soft_status: Option<Arc<SoftStatusIndex>>,
     serve_payloads: bool,
+    block_time_ms: Option<u64>,
 }
 
 fn history_router(
     history: Arc<dyn coro_demo::SequencerHistory>,
     soft_status: Option<Arc<SoftStatusIndex>>,
     config: HistoryServerConfig,
+    block_time_ms: Option<u64>,
 ) -> Router {
     let state = HistoryApiState {
         history: history.clone(),
         soft_status,
         serve_payloads: config.serve_payloads,
+        block_time_ms,
     };
     Router::new()
         .route("/health", get(health))
         .route("/healthz", get(health))
+        .route("/config", get(history_config))
         .route("/head", get(history_head))
         .route("/archived-head", get(history_archived_head))
         .route("/block-head", get(block_archived_head))
         .route("/published-block-head", get(block_published_head))
+        .route("/blocks/recent", get(recent_blocks))
         .route("/status/{sequence}", get(history_status))
         .route("/block-status/{height}", get(block_status))
         .route("/cursor/{sequence}", get(history_cursor))
@@ -53,19 +58,65 @@ pub(crate) async fn serve_history(
     history: Arc<dyn SequencerHistory>,
     soft_status: Option<Arc<SoftStatusIndex>>,
     config: HistoryServerConfig,
+    block_time_ms: Option<u64>,
     bind: SocketAddr,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, history_router(history, soft_status, config)).await
+    axum::serve(
+        listener,
+        history_router(history, soft_status, config, block_time_ms),
+    )
+    .await
 }
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+async fn history_config(AxumState(state): AxumState<HistoryApiState>) -> impl IntoResponse {
+    axum::Json(ConfigResponse {
+        block_time_ms: state.block_time_ms,
+    })
+}
+
 #[derive(Serialize)]
 struct HeadResponse {
     head: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RecentBlocksQuery {
+    soft: Option<usize>,
+    published: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct RecentBlocksResponse {
+    archived_head: Option<u64>,
+    published_head: Option<u64>,
+    blocks: Vec<BlockRecordResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BlockRecordStatus {
+    Archived,
+    Published,
+}
+
+#[derive(Serialize)]
+struct BlockRecordResponse {
+    status: BlockRecordStatus,
+    block: BlockResponse,
+    soft: SoftConfirmResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<CommitResponse>,
+}
+
+#[derive(Serialize)]
+struct ConfigResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_time_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -99,7 +150,15 @@ struct BlobRefResponse {
 }
 
 #[derive(Serialize)]
+struct BlockResponse {
+    height: u64,
+    timestamp: u64,
+    digest: String,
+}
+
+#[derive(Serialize)]
 struct SoftConfirmResponse {
+    block: BlockResponse,
     block_timestamp_ms: u64,
     soft_confirmed_at_ms: u64,
     soft_latency_ms: u64,
@@ -138,11 +197,22 @@ impl From<BatchCursor> for CursorResponse {
 impl From<&SoftBlock> for SoftConfirmResponse {
     fn from(block: &SoftBlock) -> Self {
         Self {
+            block: BlockResponse::from(block),
             block_timestamp_ms: block.metadata.timestamp,
             soft_confirmed_at_ms: block.soft_confirmed_at,
             soft_latency_ms: block
                 .soft_confirmed_at
                 .saturating_sub(block.metadata.timestamp),
+        }
+    }
+}
+
+impl From<&SoftBlock> for BlockResponse {
+    fn from(block: &SoftBlock) -> Self {
+        Self {
+            height: block.metadata.height,
+            timestamp: block.metadata.timestamp,
+            digest: hex(block.metadata.digest.as_ref()),
         }
     }
 }
@@ -223,6 +293,57 @@ async fn block_published_head(AxumState(state): AxumState<HistoryApiState>) -> i
         .into_response(),
         None => history_head(AxumState(state)).await.into_response(),
     }
+}
+
+async fn recent_blocks(
+    axum::extract::Query(query): axum::extract::Query<RecentBlocksQuery>,
+    AxumState(state): AxumState<HistoryApiState>,
+) -> impl IntoResponse {
+    let Some(index) = &state.soft_status else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let archived_head = index.archived_head().await;
+    let published_head = index.published_head().await;
+    let mut heights = std::collections::BTreeSet::new();
+
+    if let Some(head) = archived_head {
+        let soft = query.soft.unwrap_or(35);
+        let start = head.saturating_sub(soft.saturating_sub(1) as u64);
+        heights.extend(start..=head);
+    }
+
+    if let Some(head) = published_head {
+        let published = query.published.unwrap_or(15);
+        let start = head.saturating_sub(published.saturating_sub(1) as u64);
+        heights.extend(start..=head);
+    }
+
+    let mut blocks = Vec::new();
+    for height in heights.into_iter().rev() {
+        let Some(block) = index.soft_block(height).await else {
+            continue;
+        };
+        let commit = block.commit.clone();
+        let status = if commit.is_some() {
+            BlockRecordStatus::Published
+        } else {
+            BlockRecordStatus::Archived
+        };
+        blocks.push(BlockRecordResponse {
+            status,
+            block: BlockResponse::from(&block),
+            soft: SoftConfirmResponse::from(&block),
+            commit: commit.map(CommitResponse::from),
+        });
+    }
+
+    axum::Json(RecentBlocksResponse {
+        archived_head,
+        published_head,
+        blocks,
+    })
+    .into_response()
 }
 
 async fn history_status(

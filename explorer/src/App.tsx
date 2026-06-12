@@ -46,6 +46,11 @@ const CORO_PUBLISHED_WINDOW = 15;
 const CORO_FETCH_CONCURRENCY = 8;
 
 type CoroSoftTiming = {
+  block?: {
+    height: number;
+    timestamp: number;
+    digest: string;
+  };
   block_timestamp_ms: number;
   soft_confirmed_at_ms: number;
   soft_latency_ms: number;
@@ -67,6 +72,23 @@ type CoroCommitTiming = {
 type CoroStatusResponse =
   | { status: "archived"; soft?: CoroSoftTiming }
   | { status: "published"; cursor: unknown; soft?: CoroSoftTiming; commit?: CoroCommitTiming };
+
+type CoroRecentBlock = {
+  status: "archived" | "published";
+  block: {
+    height: number;
+    timestamp: number;
+    digest: string;
+  };
+  soft: CoroSoftTiming;
+  commit?: CoroCommitTiming;
+};
+
+type CoroRecentBlocksResponse = {
+  archived_head: number | null;
+  published_head: number | null;
+  blocks: CoroRecentBlock[];
+};
 
 type CoroBlockRecord = {
   block: BlockJs;
@@ -754,7 +776,62 @@ const App: React.FC = () => {
       coroPollInFlightRef.current = true;
 
       try {
-        await ensureWasm();
+        const recent = await fetchJson<CoroRecentBlocksResponse>(
+          `/blocks/recent?soft=${CORO_SOFT_WINDOW}&published=${CORO_PUBLISHED_WINDOW}`,
+        );
+        if (recent) {
+          if (cancelled || recent.archived_head === null || recent.archived_head === undefined) return;
+
+          if (
+            coroLastArchivedHeadRef.current !== null &&
+            recent.archived_head < coroLastArchivedHeadRef.current
+          ) {
+            coroBlockCacheRef.current.clear();
+            coroStatusCacheRef.current.clear();
+            setViews([]);
+            setLastObservedView(null);
+          }
+          coroLastArchivedHeadRef.current = recent.archived_head;
+
+          const records = recent.blocks.map((record): CoroBlockRecord => {
+            const block = {
+              height: Number(record.block.height),
+              timestamp: Number(record.block.timestamp),
+              digest: hexToUint8Array(record.block.digest),
+              parent: new Uint8Array(),
+            };
+            coroBlockCacheRef.current.set(block.height, block);
+            return {
+              block,
+              status: record.status === "published" ? "published" : "archived",
+              softLatencyMs: record.commit?.soft_to_pfb_broadcast_ms,
+              publishLatencyMs:
+                record.commit?.publish_latency_ms ?? record.commit?.backend_commit_latency_ms,
+            };
+          });
+          upsertCoroBlocks(records);
+
+          const lowestTracked = Math.max(
+            0,
+            Math.min(
+              recent.archived_head - CORO_SOFT_WINDOW + 1,
+              recent.published_head !== null && recent.published_head !== undefined
+                ? recent.published_head - CORO_PUBLISHED_WINDOW + 1
+                : recent.archived_head,
+            ),
+          );
+          for (const sequence of Array.from(coroBlockCacheRef.current.keys())) {
+            if (sequence < lowestTracked) {
+              coroBlockCacheRef.current.delete(sequence);
+              coroStatusCacheRef.current.delete(sequence);
+            }
+          }
+
+          setErrorMessage("");
+          setShowError(false);
+          return;
+        }
+
         const archived = await fetchJson<{ head: number | null }>("/block-head");
         const published = await fetchJson<{ head: number | null }>("/published-block-head");
         if (cancelled || archived?.head === null || archived?.head === undefined) return;
@@ -794,12 +871,27 @@ const App: React.FC = () => {
           }
 
           let block = coroBlockCacheRef.current.get(height);
+          if (!block && statusResponse.soft?.block) {
+            block = {
+              height: Number(statusResponse.soft.block.height),
+              timestamp: Number(statusResponse.soft.block.timestamp),
+              digest: hexToUint8Array(statusResponse.soft.block.digest),
+              parent: new Uint8Array(),
+            };
+            coroBlockCacheRef.current.set(height, block);
+          }
           if (!block) {
+            await ensureWasm();
             const payloadResponse = await fetchWithTimeout(`/block/${height}`);
             if (!payloadResponse.ok) return null;
             const payload = new Uint8Array(await payloadResponse.arrayBuffer());
-            block = parse_block(payload) as BlockJs | undefined;
-            if (block) {
+            const parsed = parse_block(payload) as BlockJs | undefined;
+            if (parsed) {
+              block = {
+                ...parsed,
+                height: Number(parsed.height),
+                timestamp: Number(parsed.timestamp),
+              };
               coroBlockCacheRef.current.set(height, block);
             }
           }

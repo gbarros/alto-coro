@@ -131,6 +131,7 @@ fn run_sequencer(path: PathBuf) -> Result<(), Box<dyn Error>> {
                         HistoryServerConfig {
                             serve_payloads: config.serve_payloads,
                         },
+                        Some(config.block_time_ms),
                         history_listen,
                     )
                     .await
@@ -216,6 +217,7 @@ fn run_sequencer(path: PathBuf) -> Result<(), Box<dyn Error>> {
                         HistoryServerConfig {
                             serve_payloads: config.serve_payloads,
                         },
+                        Some(config.block_time_ms),
                         history_listen,
                     )
                     .await
